@@ -1,0 +1,17 @@
+## Interface: 11509, 11507
+## Title: LiteFlipper
+## Notes: Lightweight Auctionator-powered market values and flipping hints for Classic Era.
+## Author: Codex
+## Version: 0.1.0
+## OptionalDeps: Auctionator
+## SavedVariables: LiteFlipperDB
+
+Core.lua
+AuctionatorBridge.lua
+Market.lua
+Tooltip.lua
+Scanner.lua
+RecipeData.lua
+Crafting.lua
+CraftTree.lua
+Bags.lua
