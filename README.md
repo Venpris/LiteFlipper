@@ -29,7 +29,7 @@ LiteFlipper is a small Classic Era auction helper for players who want market-va
 - `/lf scan` - scan the current auction house browse results, or show the saved LiteFlipper scan if no current rows are available.
 - `/lf browse` - show auction rows without threshold, profit, or visible-supply filters. Add text like `/lf browse copper` to pre-fill the table search.
 - `/lf craft alchemy` (or `/lf scan alchemy`) - rank recorded alchemy recipes by crafting profit. Any profession name or prefix works.
-- `/lf alch`, `/lf eng`, `/lf ench`, `/lf bs`, `/lf tailor` - open the corresponding profession's crafting results directly.
+- `/lf alch`, `/lf eng`, `/lf ench`, `/lf bs`, `/lf lw`, `/lf tailor` - open the corresponding profession's crafting results directly.
 - `/lf craft` - list professions with recorded recipes.
 - `/lf price silk` (or `/lf search`) - look up saved prices for items matching a name, item link, or item id: market value, current scan low, vendor price, price trend, and historical low/high.
 - `/lf trend silk` (or `/lf history`) - price trend, volatility, historical low/high, and the day-by-day price history Auctionator has recorded for matching items.

@@ -267,6 +267,7 @@ local PROFESSION_SHORTCUTS = {
   eng = "engineering",
   ench = "enchanting",
   bs = "blacksmithing",
+  lw = "leatherworking",
   tailor = "tailoring",
 }
 
@@ -382,7 +383,7 @@ function LF:ApplySettings(args)
     self:Print("/lf scan - find deals in current auction results, or show the saved scan if no current rows are available")
     self:Print("/lf browse - show auction rows without threshold, profit, or supply filters")
     self:Print("/lf craft alchemy - rank recorded alchemy recipes by crafting profit (also /lf scan alchemy)")
-    self:Print("/lf alch | eng | ench | bs | tailor - open that profession's crafting results")
+    self:Print("/lf alch | eng | ench | bs | lw | tailor - open that profession's crafting results")
     self:Print("/lf craft - list professions with recorded recipes")
     self:Print("/lf price silk - look up saved prices, trend, and historical low/high for matching items")
     self:Print("/lf trend silk - price trend, volatility, low/high, and day-by-day history from Auctionator's price database")
