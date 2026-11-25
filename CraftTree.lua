@@ -21,7 +21,7 @@ end
 -- Cheapest way to buy one unit outright: current scan low, market value, or
 -- unlimited vendor supply.
 local function GetBuyInfo(itemId)
-  local vendor = LF.db and LF.db.vendorPrices and LF.db.vendorPrices[tostring(itemId)]
+  local vendor = LF:GetVendorPrice(itemId)
   local market = LF:GetMarketValue(itemId)
   local current = LF:GetLatestScanMinPrice(itemId)
 
@@ -41,7 +41,7 @@ end
 local function ResolveNodeName(itemId, name, recipe)
   return name
     or (recipe and recipe.name)
-    or (GetItemInfo and GetItemInfo(itemId))
+    or LF:GetItemName(itemId)
     or ("item " .. itemId)
 end
 
@@ -197,7 +197,7 @@ function LF:RefreshCraftTree()
   local productValue = self:GetCurrentAuctionPrice(root.itemId)
   local netValue = productValue and math.floor(productValue * numMade * (1 - AH_CUT)) or nil
 
-  frame.productIcon:SetTexture((GetItemIcon and GetItemIcon(root.itemId)) or "Interface\\Icons\\INV_Misc_QuestionMark")
+  frame.productIcon:SetTexture(self:GetItemIcon(root.itemId))
   frame.productName:SetText(root.name .. (numMade > 1 and ("  (makes " .. numMade .. ")") or ""))
   frame.saleLine:SetText("Sale after 5% AH cut: " .. (netValue and self:FormatMoney(netValue) or "no price data"))
 
@@ -221,22 +221,20 @@ function LF:RefreshCraftTree()
   self:RenderCraftTreePage()
 end
 
-local function TreeRowOnClick(self)
+local function TreeRowOnClick(self, button)
   local node = self.node
   if not node then
     return
   end
 
-  local link = GetItemInfo and select(2, GetItemInfo(node.itemId)) or nil
-  if not link then
+  if button == "RightButton" then
+    if LF.ShowPriceHistory then
+      LF:ShowPriceHistory(node.itemId, { name = node.name })
+    end
     return
   end
 
-  if ChatEdit_GetActiveWindow() then
-    ChatEdit_InsertLink(link)
-  else
-    HandleModifiedItemClick(link)
-  end
+  LF:HandleItemClick(LF:GetItemLink(node.itemId))
 end
 
 local function TreeRowOnEnter(self)
@@ -264,6 +262,7 @@ local function TreeRowOnEnter(self)
     GameTooltip:AddLine("Use the Buy/Craft button to switch how", 0.75, 0.75, 0.75)
     GameTooltip:AddLine("this material is obtained.", 0.75, 0.75, 0.75)
   end
+  GameTooltip:AddLine("Right-click for price history.", 0.65, 0.65, 0.65)
   GameTooltip:Show()
 end
 
@@ -272,8 +271,23 @@ local function TreeRowOnLeave()
 end
 
 local function IsAuctionHouseOpen()
-  return (AuctionFrame and AuctionFrame:IsShown())
-    or (AuctionHouseFrame and AuctionHouseFrame:IsShown())
+  return LF:IsAuctionHouseOpen()
+end
+
+-- Blizzard's own Buy tab, for when Auctionator is not installed.
+local function SearchBlizzardAuctionHouse(name)
+  local frame = AuctionHouseFrame
+  local searchBar = frame and frame.SearchBar
+  if not (searchBar and searchBar.SetSearchText and searchBar.StartSearch) then
+    return false
+  end
+
+  if frame.SetDisplayMode and AuctionHouseFrameDisplayMode and AuctionHouseFrameDisplayMode.Buy then
+    frame:SetDisplayMode(AuctionHouseFrameDisplayMode.Buy)
+  end
+  searchBar:SetSearchText(name)
+  searchBar:StartSearch()
+  return true
 end
 
 function LF:FindCraftMaterialAtAuctionHouse(node)
@@ -295,25 +309,15 @@ function LF:FindCraftMaterialAtAuctionHouse(node)
     self:Debug("Auctionator Shopping search failed: " .. tostring(errorMessage))
   end
 
-  -- Auctionator is optional. Fall back to Blizzard's Browse tab when its
+  -- Auctionator is optional. Fall back to Blizzard's Buy tab when its
   -- Shopping search API is unavailable.
-  if AuctionFrameTab1 and AuctionFrameTab1.Click then
-    AuctionFrameTab1:Click()
-  end
-  if BrowseName and BrowseName.SetText then
-    BrowseName:SetText(node.name)
-  end
-
-  if AuctionFrameBrowse_Search then
-    AuctionFrameBrowse_Search()
-  elseif QueryAuctionItems then
-    QueryAuctionItems(node.name, nil, nil, 0, false, nil, false, true)
-  else
-    self:Print("The auction browse search is not available in this auction-house UI.")
+  local ok, searched = pcall(SearchBlizzardAuctionHouse, node.name)
+  if not ok or not searched then
+    self:Print("The auction house search is not available in this auction-house UI.")
     return
   end
 
-  self:Print("Searching the auction-house Browse tab for " .. node.name .. ". Review the results and confirm the purchase there.")
+  self:Print("Searching the auction house Buy tab for " .. node.name .. ". Review the results and confirm the purchase there.")
 end
 
 local function ScrollCraftTreeByWheel(delta)
@@ -380,7 +384,7 @@ function LF:RenderCraftTreePage()
       row.unitText:SetText(node.effectiveUnit and self:FormatMoney(node.effectiveUnit) or "-")
       row.totalText:SetText(node.totalCost and self:FormatMoney(node.totalCost) or "-")
       row.sourceText:SetText(node.mode == "craft" and "craft" or (node.buySource or "-"))
-      row.icon:SetTexture((GetItemIcon and GetItemIcon(node.itemId)) or "Interface\\Icons\\INV_Misc_QuestionMark")
+      row.icon:SetTexture(self:GetItemIcon(node.itemId))
       row:Show()
     else
       row:Hide()
@@ -490,6 +494,7 @@ function LF:CreateCraftTreeFrame()
     row:SetHeight(ROW_HEIGHT)
     row:SetPoint("TOPLEFT", 16, -116 - ((index - 1) * ROW_HEIGHT))
     row:SetPoint("RIGHT", -34, 0)
+    row:RegisterForClicks("LeftButtonUp", "RightButtonUp")
     row:SetScript("OnClick", TreeRowOnClick)
     row:SetScript("OnEnter", TreeRowOnEnter)
     row:SetScript("OnLeave", TreeRowOnLeave)

@@ -1,57 +1,61 @@
-# LiteFlipper
+# LiteFlipper (WoW Forever)
 
-LiteFlipper is a small Classic Era auction helper for players who want market-value tooltips and basic flipping hints without replacing the auction house or mailbox UI.
+LiteFlipper is a small auction helper for players who want market-value tooltips, price history and basic flipping hints without replacing the auction house or mailbox UI. This is the WoW Forever port of the Classic Era addon.
 
 ## What it does
 
-- Adds market value, cost-to-craft, and `Recent low today` lines to item tooltips when those values are known.
-- Reads Auctionator prices when Auctionator exposes them.
-- Keeps its own rolling daily history in `LiteFlipperDB`.
-- Tracks daily supply snapshots from your scans and labels supply trend as `Up`, `Flat`, `Down`, or `New`.
-- Compares current prices against recent lows and labels them as `At low`, `Near low`, or `Above low`.
-- Scans the currently visible auction browse results and lists buyouts that are below your configured market threshold, or browses all rows without threshold filters.
-- Filters out deals when the item has too few visible units in the scan, which helps hide one-off BoEs and other very thin markets.
-- Shows scan results in a paged, sortable table with item icons, hoverable item tooltips, colored under-market percentages, unit price, market value, profit, visible supply, and trend.
-- Groups matching deal rows by item, unit price, and seller so repeated single-stack postings appear as one result with total quantity and lot count.
-- Both results windows have a search box that live-filters rows by item name, and `/lf price <name>` looks up saved prices for any item from chat.
-- Records outlier-trimmed listing prices from each scan, then uses the rolling 7-day scan history for market value before falling back to Auctionator's daily price history, its last-seen price, and older daily data. When Auctionator has enough history, LiteFlipper caps scan-derived market value at the observed historical high.
-- Reads Auctionator's 21-day price history (the data behind its History button) to show `Price trend`, `Volatility`, and historical low/high lines in tooltips, so you can hold items that are trending up instead of selling into a dip.
-- Persists the latest AH result snapshot LiteFlipper can see, replacing it whenever current AH rows update, so `/lf scan` can fall back to that snapshot when no current rows are available.
-- Ships static recipe data for every Classic Era profession (about 1,400 recipes generated from the game's own database files), so crafting scans cover all craftable items, not just the ones your characters know.
-- Remembers which recipes your characters actually know whenever you open a profession window, and remembers vendor prices whenever you visit a merchant.
-- Ranks recipes by crafting profit with `/lf craft <profession>`: material cost uses the cheapest of the current scan price, market value, and vendor price, and the sale value is the product's current auction-house price minus the 5% auction house cut. The sortable table includes `Mats%` so you can spot when materials are underpriced. Recipes known to your characters show in white; unknown ones are greyed out.
-- The craft tree has a `Find` button for each non-vendor material. With the auction house open, it searches Auctionator's Shopping tab for that exact item; the player reviews and confirms the purchase there. Blizzard's Browse tab is used as a fallback when Auctionator is unavailable.
-- Material costing is recursive: if a reagent is itself craftable (bars, bolts, essences), LiteFlipper compares buying it against crafting it from its own materials and uses the cheaper path, all the way down the tree. The row tooltip shows crafted reagents with their sub-materials indented beneath them.
-- Market values weight each listing once, no matter the stack size, and anchor outlier detection on the lower median unique unit price - so one repeated price wall cannot drag the market value up.
+- Adds market value, current low, cost-to-craft, price trend, volatility and `Recent low today` lines to item tooltips when those values are known.
+- Adds a **History** button to Auctionator's buy panel (under `Buy Now` for stackable items, next to `Back` for single items). It opens a table with the item's price on each day you scanned: lowest and highest price that day, units available, and the change from the previous day. `/lf history <item>` opens the same window anywhere, and so does right-clicking a row in any LiteFlipper table.
+- Reads Auctionator's price database (the same per-day records Auctionator keeps for 21 days by default) and keeps its own rolling history in `LiteFlipperDB`.
+- Picks up every Auctionator scan automatically, and also learns from ordinary searches and from items you open in the buy panel, so prices stay fresh between full scans.
+- Lists items priced below your configured market threshold (`/lf scan`), or all rows without filters (`/lf browse`), in a paged, sortable table with a name search box.
+- Tracks daily supply and labels the supply trend as `Up`, `Flat`, `Down`, or `New`.
+- Ships recipe data for the WoW Forever professions (about 2,000 item-producing recipes) and ranks them by crafting profit with `/lf craft <profession>`. Material cost is the cheapest of the current low, market value, vendor price, or crafting the material yourself, all the way down the tree.
+- Knows which recipes your characters have learned (white rows; unknown ones are grey) without needing the profession window, and reads the real reagents from the profession window when you open it.
+- Remembers vendor prices whenever you visit a merchant.
+- The craft tree (`/lf tree <item>`) has a `Find` button per material that searches Auctionator's Shopping tab for that exact item.
 
 ## Commands
 
-- `/lf scan` - scan the current auction house browse results, or show the saved LiteFlipper scan if no current rows are available.
-- `/lf browse` - show auction rows without threshold, profit, or visible-supply filters. Add text like `/lf browse copper` to pre-fill the table search.
-- `/lf craft alchemy` (or `/lf scan alchemy`) - rank recorded alchemy recipes by crafting profit. Any profession name or prefix works.
-- `/lf alch`, `/lf eng`, `/lf ench`, `/lf bs`, `/lf lw`, `/lf tailor` - open the corresponding profession's crafting results directly.
-- `/lf craft` - list professions with recorded recipes.
-- `/lf price silk` (or `/lf search`) - look up saved prices for items matching a name, item link, or item id: market value, current scan low, vendor price, price trend, and historical low/high.
-- `/lf trend silk` (or `/lf history`) - price trend, volatility, historical low/high, and the day-by-day price history Auctionator has recorded for matching items.
-- `/lf bags` - value the sellable items currently in your bags: quantity, unit market value, total AH value, current scan low, and vendor sell value. Soulbound items are skipped.
-- `/lf uses briarthorn` (or `/lf mat`) - show every recipe across all professions that uses a material, with crafting margins, in the crafting window.
-- `/lf tree copper tube` (or `/lf plan`) - open the buy-vs-craft material tree planner for a craftable item.
+- `/lf scan` - find deals in the current auction results, or in the saved scan if only a small result set is on screen.
+- `/lf browse` - show auction rows without threshold, profit, or supply filters. `/lf browse copper` pre-fills the search.
+- `/lf history silk` - open the price history window for an item. With no item, uses the one open in Auctionator's buy panel.
+- `/lf price silk` (or `/lf search`) - market value, current low, vendor price, trend, and historical low/high in chat.
+- `/lf trend silk` - trend, volatility, low/high and the day-by-day prices in chat.
+- `/lf craft alchemy` (or `/lf scan alchemy`) - rank recipes by crafting profit. Any profession name or prefix works; `/lf alch`, `/lf eng`, `/lf ench`, `/lf bs`, `/lf lw`, `/lf tailor`, `/lf cook` are shortcuts.
+- `/lf craft` - list professions with recipe data.
+- `/lf bags` - value the sellable items in your bags.
+- `/lf uses briarthorn` (or `/lf mat`) - every recipe that uses a material, with margins.
+- `/lf tree copper tube` (or `/lf plan`) - buy-vs-craft material tree planner.
 - `/lf threshold 80` - flag auctions at or below 80% of market value.
+- `/lf minthreshold 10` - ignore auctions below 10% of market (0 disables).
 - `/lf profit 1` - require at least 1g estimated unit profit.
-- `/lf supply 5` - require at least 5 visible units for an item to appear in deal results, or use `0` to disable.
-- `/lf hovertooltip` - toggle LiteFlipper market/trend lines on item hover tooltips. Use `/lf hovertooltip on` or `/lf hovertooltip off` to set it directly. `/lf tooltip` is also supported as an alias.
+- `/lf supply 5` - require at least 5 visible units, or `0` to disable.
+- `/lf purge 3` - delete market history older than 3 hours for this auction house.
+- `/lf hovertooltip [on|off]` - toggle LiteFlipper lines on item tooltips (`/lf tooltip` also works).
 - `/lf help` - show commands.
+
+## How the data works on WoW Forever
+
+WoW Forever uses the modern auction house, which changes what LiteFlipper can see compared with Classic Era:
+
+- **Scans are summaries by default.** Auctionator's normal full scan pages through the browse list and yields one row per item: its lowest price and total quantity. LiteFlipper stores that as its snapshot, so in `/lf scan` and `/lf browse` the unit price is the item's cheapest listing and `Qty` is everything on the auction house. If you turn on Auctionator's replicate scan option, LiteFlipper gets every individual auction instead, as on Classic Era.
+- **Opening an item fills in the detail.** When you click an item in the Shopping tab, LiteFlipper records the whole price ladder shown in the buy panel, which gives a better average than the cheapest listing alone.
+- **Market value** is an outlier-trimmed average of LiteFlipper's own samples from the last 7 days. While LiteFlipper has fewer days recorded than Auctionator (for example right after installing it), Auctionator's daily history is used instead.
+- **Markets are per ruleset and faction.** Forever's auction houses are shared across realms with the same ruleset, so LiteFlipper keeps one set of data per ruleset and faction (for example `PvE::Alliance`), matching Auctionator.
+- **History rows.** Each scan notes an item's cheapest listing. `Low` and `High` in the history window are the smallest and largest of those across the day's scans. White dates come from Auctionator's database; blue dates are days only LiteFlipper recorded.
+
+LiteFlipper never sends auction house queries, buys, bids or posts anything. It only reads results that Auctionator or you requested.
 
 ## Install
 
-Copy the `LiteFlipper` folder into:
+The folder goes in `World of Warcraft/_forever_/Interface/AddOns/LiteFlipper`.
 
-`World of Warcraft/_classic_era_/Interface/AddOns/`
-
-Auctionator is optional, but the addon is much more useful with Auctionator installed because it can seed market values from Auctionator's stored price data.
+Auctionator is optional, but it is what performs full scans and holds the longer price history, and the History button lives on its buy panel. Without it LiteFlipper still records whatever you search for in Blizzard's own auction house UI.
 
 ## Notes
 
-LiteFlipper intentionally does not skin, replace, or automate the auction house. It only reads visible auction rows and saved price data, then shows you candidates.
-
-Crafting scans cover all recipes from the bundled `RecipeData.lua` (generated from wago.tools DB2 exports of the Classic Era client) plus anything recorded from your profession windows. "Known" status comes from opening a profession window at least once on the crafting character; Enchanting recipes are always shown as unknown because its window uses the separate crafting API that LiteFlipper does not read. Recipes whose product or reagents have no recorded price yet are skipped and counted in the summary; scan the auction house (or a full Auctionator scan) to fill in prices.
+- Recipe data in `RecipeData.lua` is generated by `tools/gen_recipes.py` from the WoW Forever recipe tables bundled with the CraftPath addon. Many Forever items are new and have no bundled name; LiteFlipper asks the game for those names in the background after login and remembers them, so name searches for new items work a little after your first login.
+- Recipes that make no item (most enchants) are not listed. Recipes whose product or reagents have no recorded price yet are skipped and counted in the summary.
+- "Known" status is account-wide: a recipe is white once any character LiteFlipper has seen knows it.
+- `dev/test_forever.lua` is an offline test that loads the addon against a fake client: `python -I dev/runlua.py dev/test_forever.lua "ADDON_DIR=<path to this folder>"`.

@@ -1,12 +1,15 @@
-## Interface: 11509, 11507
+## Interface: 16001
 ## Title: LiteFlipper
-## Notes: Lightweight Auctionator-powered market values and flipping hints for Classic Era.
+## Notes: Lightweight Auctionator-powered market values, price history and flipping hints for WoW Forever.
 ## Author: Codex
-## Version: 0.1.0
+## Version: 0.2.0
 ## OptionalDeps: Auctionator
 ## SavedVariables: LiteFlipperDB
+## IconTexture: Interface\Icons\INV_Misc_Coin_02
+## Category: Auctions
 
 Core.lua
+Compat.lua
 AuctionatorBridge.lua
 Market.lua
 Tooltip.lua
@@ -15,3 +18,4 @@ RecipeData.lua
 Crafting.lua
 CraftTree.lua
 Bags.lua
+History.lua

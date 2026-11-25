@@ -62,17 +62,6 @@ local function ExtractItemId(link)
   return tonumber(string.match(link, "item:(%d+)"))
 end
 
-local function ExtractItemName(link)
-  if type(link) ~= "string" then
-    return nil
-  end
-  return string.match(link, "%[(.-)%]")
-end
-
-local function IsHeaderType(skillType)
-  return skillType == "header" or skillType == "subheader"
-end
-
 -- Unpack a compact ns.RecipeData entry into the same shape as recorded ones.
 local function StaticToRecipe(entry)
   local reagents = {}
@@ -81,20 +70,45 @@ local function StaticToRecipe(entry)
   end
   return {
     product = entry.p,
-    name = entry.n,
+    name = entry.n or LF:GetItemName(entry.p, true),
     numMade = entry.m or 1,
     reagents = reagents,
+    spell = entry.s,
   }
 end
 
--- Static data first, then recorded recipes overwrite so known crafts keep
--- the reagent names captured from the actual profession window.
+-- A recipe counts as known once any of your characters has been seen to know
+-- it: either the client says the current character knows the recipe spell, or
+-- it showed as learned in a profession window. The answer is remembered
+-- account-wide, like the Classic Era version remembered recorded recipes.
+function LF:IsRecipeKnown(recipe)
+  local spell = recipe and recipe.spell
+  if not spell or not self.db then
+    return false
+  end
+
+  self.db.knownRecipes = self.db.knownRecipes or {}
+  if self.db.knownRecipes[spell] then
+    return true
+  end
+
+  if self:IsSpellKnown(spell) then
+    self.db.knownRecipes[spell] = true
+    return true
+  end
+  return false
+end
+
+-- Static data first, then recipes recorded from your own profession windows
+-- overwrite it, since those carry the reagents the game actually asks for.
 local function BuildCombinedRecipes(staticData, stores, key)
   local combined = {}
 
   local static = staticData[key]
   for _, entry in ipairs((static and static.recipes) or {}) do
-    combined[tostring(entry.p)] = StaticToRecipe(entry)
+    local recipe = StaticToRecipe(entry)
+    recipe.known = LF:IsRecipeKnown(recipe)
+    combined[tostring(entry.p)] = recipe
   end
 
   local store = stores[key]
@@ -102,23 +116,16 @@ local function BuildCombinedRecipes(staticData, stores, key)
     for productKey, recipe in pairs(store.recipes) do
       combined[productKey] = {
         product = recipe.product,
-        name = recipe.name,
+        name = recipe.name or LF:GetItemName(recipe.product, true),
         numMade = recipe.numMade,
         reagents = recipe.reagents,
+        spell = recipe.spell,
         known = true,
       }
     end
   end
 
   return combined
-end
-
-local function CountTable(t)
-  local count = 0
-  for _ in pairs(t or {}) do
-    count = count + 1
-  end
-  return count
 end
 
 -- Cost% = mat cost / net sale value, so under 100 is profitable.
@@ -146,6 +153,43 @@ end
 
 -- === Vendor prices ===
 
+-- What one unit costs from a vendor with unlimited stock: the price you saw at
+-- a vendor if you have visited one, otherwise the bundled starting value.
+function LF:GetVendorPrice(itemId)
+  itemId = tonumber(itemId)
+  if not itemId then
+    return nil
+  end
+
+  local seen = self.db and self.db.vendorPrices and self.db.vendorPrices[tostring(itemId)]
+  if seen then
+    return seen
+  end
+  return ns.VendorData and ns.VendorData[itemId] or nil
+end
+
+local function ReadMerchantItem(index)
+  local price, quantity, numAvailable, extendedCost
+
+  if C_MerchantFrame and C_MerchantFrame.GetItemInfo then
+    local ok, info = pcall(C_MerchantFrame.GetItemInfo, index)
+    if ok and type(info) == "table" then
+      price, quantity = info.price, info.stackCount
+      numAvailable, extendedCost = info.numAvailable, info.hasExtendedCost
+    end
+  end
+
+  if not price and GetMerchantItemInfo then
+    local ok, _, _, legacyPrice, legacyQuantity, legacyAvailable, _, _, legacyExtended = pcall(GetMerchantItemInfo, index)
+    if ok then
+      price, quantity = legacyPrice, legacyQuantity
+      numAvailable, extendedCost = legacyAvailable, legacyExtended
+    end
+  end
+
+  return price, quantity, numAvailable, extendedCost
+end
+
 function LF:RecordMerchantPrices()
   if not self.db or not GetMerchantNumItems then
     return
@@ -155,20 +199,19 @@ function LF:RecordMerchantPrices()
   local recorded = 0
 
   for index = 1, GetMerchantNumItems() do
-    local info = { GetMerchantItemInfo(index) }
-    local price, quantity, numAvailable = info[3], info[4], info[5]
-    -- The modern classic client returns extendedCost 8th; the old API
-    -- returned it 7th. Either way a truthy value means non-copper cost.
-    local extendedCost = info[8]
-    if extendedCost == nil then
-      extendedCost = info[7]
+    local itemId = GetMerchantItemID and GetMerchantItemID(index)
+    if not itemId then
+      itemId = ExtractItemId(GetMerchantItemLink and GetMerchantItemLink(index))
     end
 
-    local itemId = ExtractItemId(GetMerchantItemLink and GetMerchantItemLink(index))
+    local price, quantity, numAvailable, extendedCost = ReadMerchantItem(index)
+
+    -- Only plain copper prices with unlimited stock count as a vendor price;
+    -- limited-stock items cannot be relied on as a material source.
     if itemId
       and type(price) == "number" and price > 0
-      and numAvailable == -1
-      and extendedCost ~= true then
+      and (numAvailable == nil or numAvailable < 0)
+      and not extendedCost then
       local units = (type(quantity) == "number" and quantity > 0) and quantity or 1
       self.db.vendorPrices[tostring(itemId)] = math.ceil(price / units)
       recorded = recorded + 1
@@ -176,141 +219,219 @@ function LF:RecordMerchantPrices()
   end
 
   if recorded > 0 then
+    self.craftCostMemo = nil
     self:Debug("Recorded vendor prices for " .. recorded .. " item(s).")
   end
 end
 
 -- === Recipe snapshots ===
 
-function LF:SnapshotTradeSkill()
-  if not self.db or not GetTradeSkillLine then
-    return
+local function ApiFlag(api, name)
+  local fn = api[name]
+  if type(fn) ~= "function" then
+    return false
+  end
+  local ok, value = pcall(fn)
+  return ok and value and true or false
+end
+
+-- Spell id -> profession key for every bundled recipe.
+local function GetStaticSpellIndex()
+  if LF.staticSpellIndex then
+    return LF.staticSpellIndex
   end
 
-  local profName = GetTradeSkillLine()
-  if not profName or profName == "UNKNOWN" then
-    return
-  end
-
-  local numSkills = GetNumTradeSkills and GetNumTradeSkills() or 0
-  if numSkills == 0 then
-    return
-  end
-
-  local profKey = string.lower(profName)
-  self.db.craftRecipes = self.db.craftRecipes or {}
-  local store = self.db.craftRecipes[profKey] or {}
-  store.name = profName
-  store.recipes = store.recipes or {}
-  self.db.craftRecipes[profKey] = store
-
-  local added = 0
-  for index = 1, numSkills do
-    local skillName, skillType = GetTradeSkillInfo(index)
-    if skillName and not IsHeaderType(skillType) then
-      local productLink = GetTradeSkillItemLink(index)
-      local productId = ExtractItemId(productLink)
-      if productId then
-        local numMade = 1
-        if GetTradeSkillNumMade then
-          local minMade = GetTradeSkillNumMade(index)
-          if type(minMade) == "number" and minMade > 0 then
-            numMade = minMade
-          end
-        end
-
-        local reagents = {}
-        local complete = true
-        for reagentIndex = 1, (GetTradeSkillNumReagents(index) or 0) do
-          local reagentName, _, reagentCount = GetTradeSkillReagentInfo(index, reagentIndex)
-          local reagentLink = GetTradeSkillReagentItemLink(index, reagentIndex)
-          local reagentId = ExtractItemId(reagentLink)
-          if reagentId and type(reagentCount) == "number" and reagentCount > 0 then
-            table.insert(reagents, {
-              id = reagentId,
-              name = reagentName or ExtractItemName(reagentLink) or ("item " .. reagentId),
-              count = reagentCount,
-            })
-          else
-            complete = false
-          end
-        end
-
-        if complete and #reagents > 0 then
-          local key = tostring(productId)
-          if not store.recipes[key] then
-            added = added + 1
-          end
-          store.recipes[key] = {
-            product = productId,
-            name = ExtractItemName(productLink) or skillName,
-            numMade = numMade,
-            reagents = reagents,
-          }
+  local index = {}
+  for key, profession in pairs(ns.RecipeData or {}) do
+    if type(profession) == "table" then
+      for _, entry in ipairs(profession.recipes or {}) do
+        if entry.s then
+          index[entry.s] = key
         end
       end
     end
   end
 
-  store.updatedAt = time()
-  -- Recorded recipes feed the product -> recipe index used for recursive
-  -- reagent costing, so rebuild it on the next lookup.
-  self.craftIndex = nil
+  LF.staticSpellIndex = index
+  return index
+end
 
-  if added > 0 then
-    self:Print("Recorded " .. added .. " new " .. profName .. " recipe(s), "
-      .. CountTable(store.recipes) .. " total. Try /lf craft " .. profKey .. ".")
+-- Reads one learned recipe's product and reagents from the client, in the
+-- shape recorded recipes are stored in. Returns nil for recipes that make no
+-- item (enchants) or whose data is not available yet.
+local function ReadRecipeSchematic(api, spell)
+  if not api.GetRecipeSchematic then
+    return nil
+  end
+
+  local ok, schematic = pcall(api.GetRecipeSchematic, spell, false)
+  if not ok or type(schematic) ~= "table" or type(schematic.reagentSlotSchematics) ~= "table" then
+    return nil
+  end
+
+  local product = schematic.outputItemID
+  if type(product) ~= "number" or product <= 0 then
+    return nil
+  end
+
+  local basic = (Enum and Enum.CraftingReagentType and Enum.CraftingReagentType.Basic) or 1
+  local reagents = {}
+  for _, slot in ipairs(schematic.reagentSlotSchematics) do
+    local first = type(slot.reagents) == "table" and slot.reagents[1]
+    if slot.reagentType == basic and slot.required ~= false and first and first.itemID
+      and (slot.quantityRequired or 0) > 0 then
+      table.insert(reagents, {
+        id = first.itemID,
+        name = LF:GetItemName(first.itemID),
+        count = slot.quantityRequired,
+      })
+    end
+  end
+
+  if #reagents == 0 then
+    return nil
+  end
+
+  local numMade = schematic.quantityMin
+  return {
+    product = product,
+    name = LF:GetItemName(product) or schematic.name,
+    numMade = (type(numMade) == "number" and numMade > 0) and numMade or 1,
+    reagents = reagents,
+    spell = spell,
+  }
+end
+
+-- Runs while one of your own profession windows is open. Marks the recipes
+-- that show as learned, and records their real reagents from the client so
+-- they take precedence over the bundled data.
+function LF:SnapshotTradeSkill()
+  local api = C_TradeSkillUI
+  if not self.db or not api or not api.GetRecipeInfo then
+    return
+  end
+
+  -- Someone else's linked profession, a guild profession or an NPC crafting
+  -- window says nothing about what your characters know.
+  if ApiFlag(api, "IsTradeSkillLinked") or ApiFlag(api, "IsTradeSkillGuild")
+    or ApiFlag(api, "IsNPCCrafting") or ApiFlag(api, "IsDataSourceChanging") then
+    return
+  end
+
+  local professionName
+  if api.GetBaseProfessionInfo then
+    local ok, info = pcall(api.GetBaseProfessionInfo)
+    if ok and type(info) == "table" then
+      professionName = info.parentProfessionName or info.professionName
+    end
+  end
+  local openKey = professionName and professionName ~= "" and string.lower(professionName) or nil
+
+  local staticSpells = GetStaticSpellIndex()
+
+  -- Candidate recipes: the bundled ones for the open profession (all of them
+  -- if the profession could not be matched by name), plus whatever the window
+  -- itself lists, which catches recipes the bundled data does not have.
+  local candidates = {}
+  local seenSpell = {}
+  local function AddCandidate(spell, profKey)
+    if type(spell) == "number" and not seenSpell[spell] then
+      seenSpell[spell] = true
+      table.insert(candidates, { spell = spell, profKey = profKey })
+    end
+  end
+
+  local staticData = ns.RecipeData or {}
+  if openKey and staticData[openKey] then
+    for _, entry in ipairs(staticData[openKey].recipes or {}) do
+      AddCandidate(entry.s, openKey)
+    end
+  else
+    for spell, profKey in pairs(staticSpells) do
+      AddCandidate(spell, profKey)
+    end
+  end
+
+  if api.GetAllRecipeIDs then
+    local ok, recipeIds = pcall(api.GetAllRecipeIDs)
+    if ok and type(recipeIds) == "table" then
+      for _, spell in ipairs(recipeIds) do
+        AddCandidate(spell, staticSpells[spell] or openKey)
+      end
+    end
+  end
+
+  self.db.knownRecipes = self.db.knownRecipes or {}
+  self.db.craftRecipes = self.db.craftRecipes or {}
+  self.schematicsRead = self.schematicsRead or {}
+
+  local newlyKnown = 0
+  local recorded = 0
+
+  for _, candidate in ipairs(candidates) do
+    local spell = candidate.spell
+    local ok, info = pcall(api.GetRecipeInfo, spell)
+    if ok and type(info) == "table" and info.learned == true then
+      if not self.db.knownRecipes[spell] then
+        self.db.knownRecipes[spell] = true
+        newlyKnown = newlyKnown + 1
+      end
+
+      local profKey = candidate.profKey
+      if profKey and not self.schematicsRead[spell] then
+        local recipe = ReadRecipeSchematic(api, spell)
+        if recipe then
+          self.schematicsRead[spell] = true
+          local store = self.db.craftRecipes[profKey] or {}
+          store.name = store.name
+            or (staticData[profKey] and staticData[profKey].name)
+            or professionName
+            or profKey
+          store.recipes = store.recipes or {}
+          store.updatedAt = time()
+          self.db.craftRecipes[profKey] = store
+
+          local productKey = tostring(recipe.product)
+          if not store.recipes[productKey] then
+            recorded = recorded + 1
+          end
+          store.recipes[productKey] = recipe
+        end
+      end
+    end
+  end
+
+  if newlyKnown > 0 or recorded > 0 then
+    -- Recorded recipes feed the product -> recipe index used for recursive
+    -- reagent costing, so rebuild it on the next lookup.
+    self.craftIndex = nil
+    self.craftCostMemo = nil
+  end
+
+  if newlyKnown > 0 then
+    local label = professionName or "profession"
+    self:Print("Noted " .. newlyKnown .. " known " .. label .. " recipe(s)."
+      .. (openKey and (" Try /lf craft " .. openKey .. ".") or ""))
   end
 end
 
+-- Profession windows fire several list updates while they fill in; wait for
+-- them to settle and read once.
 function LF:SnapshotTradeSkillSession()
-  if not GetTradeSkillLine then
+  if self.tradeSkillSnapshotQueued then
     return
   end
 
-  local profName = GetTradeSkillLine()
-  if not profName or profName == "UNKNOWN" then
-    return
-  end
-
-  local numSkills = GetNumTradeSkills and GetNumTradeSkills() or 0
-  if numSkills == 0 then
-    return
-  end
-
-  -- Only run the expand/restore dance once per window open. Expanding and
-  -- collapsing both fire TRADE_SKILL_UPDATE, so re-running it from those
-  -- events would loop forever; later updates just merge what is visible.
-  if self.tradeSkillSessionSeen then
+  if not (C_Timer and C_Timer.After) then
     self:SnapshotTradeSkill()
     return
   end
-  self.tradeSkillSessionSeen = true
 
-  local collapsedHeaders = {}
-  for index = 1, numSkills do
-    local name, skillType, _, isExpanded = GetTradeSkillInfo(index)
-    if name and IsHeaderType(skillType) and not isExpanded then
-      collapsedHeaders[name] = true
-    end
-  end
-
-  if next(collapsedHeaders) and ExpandTradeSkillSubClass then
-    ExpandTradeSkillSubClass(0)
-  end
-
-  self:SnapshotTradeSkill()
-
-  if next(collapsedHeaders) and CollapseTradeSkillSubClass then
-    -- Bottom-up so collapsing a header does not shift the indices of the
-    -- headers we still need to visit.
-    for index = GetNumTradeSkills(), 1, -1 do
-      local name, skillType = GetTradeSkillInfo(index)
-      if name and IsHeaderType(skillType) and collapsedHeaders[name] then
-        CollapseTradeSkillSubClass(index)
-      end
-    end
-  end
+  self.tradeSkillSnapshotQueued = true
+  C_Timer.After(0.6, function()
+    LF.tradeSkillSnapshotQueued = nil
+    LF:SnapshotTradeSkill()
+  end)
 end
 
 -- === Craft valuation ===
@@ -369,7 +490,7 @@ function LF:GetReagentCostInfo(itemId, visited)
     return memo[itemId]
   end
 
-  local vendor = self.db and self.db.vendorPrices and self.db.vendorPrices[tostring(itemId)]
+  local vendor = self:GetVendorPrice(itemId)
   local market = self:GetMarketValue(itemId)
   local current = self:GetLatestScanMinPrice(itemId)
 
@@ -456,7 +577,7 @@ end
 -- appear where crafting was actually the cheapest option.
 local function AddReagentLines(lines, id, name, needed, info, depth)
   table.insert(lines, {
-    name = name or (GetItemInfo and GetItemInfo(id)) or ("item " .. id),
+    name = name or LF:GetItemName(id) or ("item " .. id),
     countText = FormatCount(needed),
     total = math.floor((info.now * needed) + 0.5),
     source = info.source,
@@ -518,7 +639,7 @@ function LF:EvaluateCraft(recipe)
 
   return {
     recipe = recipe,
-    displayName = (GetItemInfo and GetItemInfo(recipe.product)) or recipe.name,
+    displayName = self:GetItemName(recipe.product) or recipe.name or ("item " .. tostring(recipe.product)),
     productValue = productValue,
     netValue = netValue,
     matNow = matNow,
@@ -555,7 +676,7 @@ function LF:CraftScan(professionArg)
   table.sort(professionKeys)
 
   if #professionKeys == 0 then
-    self:Print("No recipe data found. Open a profession window (like Alchemy) once and LiteFlipper will remember its recipes.")
+    self:Print("No recipe data found.")
     return
   end
 
@@ -747,13 +868,11 @@ local function CraftRowOnClick(self)
     return
   end
 
-  local link = GetItemInfo and select(2, GetItemInfo(result.recipe.product)) or nil
-  if link and ChatEdit_GetActiveWindow() then
-    ChatEdit_InsertLink(link)
-    return
-  end
-  if link and IsModifiedClick and (IsModifiedClick("CHATLINK") or IsModifiedClick("DRESSUP")) then
-    HandleModifiedItemClick(link)
+  -- Shift-click links the item and ctrl-click previews it, as on any item;
+  -- a plain click opens the craft tree.
+  local link = LF:GetItemLink(result.recipe.product)
+  if link and LF:IsModifiedLinkClick() then
+    LF:HandleItemClick(link)
     return
   end
 
@@ -774,7 +893,7 @@ local function CraftRowOnEnter(self)
   if result.recipe.known then
     GameTooltip:AddLine("Known recipe", 0.20, 1.00, 0.20)
   else
-    GameTooltip:AddLine("Not seen in your profession windows", 0.60, 0.60, 0.60)
+    GameTooltip:AddLine("Not known by a character LiteFlipper has seen", 0.60, 0.60, 0.60)
   end
   if (result.recipe.numMade or 1) > 1 then
     GameTooltip:AddLine("Makes " .. result.recipe.numMade, 0.75, 0.75, 0.75)
@@ -836,6 +955,14 @@ function LF:RenderCraftPage()
       local pct = math.floor(result.pct * 100 + 0.5)
       local pctR, pctG, pctB = GetCraftPercentColor(pct)
       row.cells.rank:SetText(resultIndex .. ".")
+      -- Names of new items can arrive after the scan was priced.
+      if not result.namedFromClient then
+        local name = self:GetItemName(result.recipe.product)
+        if name then
+          result.displayName = name
+          result.namedFromClient = true
+        end
+      end
       row.cells.item:SetText(result.displayName or result.recipe.name)
       if result.recipe.known then
         row.cells.item:SetTextColor(1, 1, 1)
@@ -859,7 +986,7 @@ function LF:RenderCraftPage()
 
       row.cells.pct:SetTextColor(pctR, pctG, pctB)
       row.cells.profit:SetTextColor(pctR, pctG, pctB)
-      row.icon:SetTexture((GetItemIcon and GetItemIcon(result.recipe.product)) or "Interface\\Icons\\INV_Misc_QuestionMark")
+      row.icon:SetTexture(self:GetItemIcon(result.recipe.product))
       row:Show()
     else
       for _, cell in pairs(row.cells) do
@@ -1092,20 +1219,27 @@ end
 -- === Events ===
 
 local eventFrame = CreateFrame("Frame")
-eventFrame:RegisterEvent("TRADE_SKILL_SHOW")
-eventFrame:RegisterEvent("TRADE_SKILL_UPDATE")
-eventFrame:RegisterEvent("TRADE_SKILL_CLOSE")
-eventFrame:RegisterEvent("MERCHANT_SHOW")
 eventFrame:SetScript("OnEvent", function(_, event)
   if not LF.db then
     return
   end
 
-  if event == "MERCHANT_SHOW" then
+  if event == "MERCHANT_SHOW" or event == "MERCHANT_UPDATE" then
     LF:RecordMerchantPrices()
-  elseif event == "TRADE_SKILL_CLOSE" then
-    LF.tradeSkillSessionSeen = nil
   else
     LF:SnapshotTradeSkillSession()
   end
 end)
+
+for _, event in ipairs({
+  "TRADE_SKILL_SHOW",
+  "TRADE_SKILL_LIST_UPDATE",
+  "TRADE_SKILL_DATA_SOURCE_CHANGED",
+  "NEW_RECIPE_LEARNED",
+  "MERCHANT_SHOW",
+  "MERCHANT_UPDATE",
+}) do
+  -- Which of these exist differs between client flavours, and registering a
+  -- missing event raises an error.
+  pcall(eventFrame.RegisterEvent, eventFrame, event)
+end

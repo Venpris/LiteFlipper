@@ -2,11 +2,11 @@ local _, ns = ...
 local LF = ns.LF
 
 local DAY_SECONDS = 86400
-local AUCTIONATOR_CACHE_SECONDS = 900
+local AUCTIONATOR_CACHE_SECONDS = 60
 local AUCTIONATOR_MISS_CACHE_SECONDS = 60
 local AUCTIONATOR_TREND_CACHE_SECONDS = 600
-local AUCTIONATOR_SEARCH_SOURCE = "Auctionator search"
 local AUCTIONATOR_FULL_SCAN_SOURCE = "Auctionator full scan"
+local AUCTIONATOR_SUMMARY_SCAN_SOURCE = "Auctionator scan"
 
 -- Wider fences than the market-value ones: a single freak day (1c dump or a
 -- gouged lone listing) should not decide the trend, but normal swings must
@@ -22,20 +22,82 @@ local function IsCopper(value)
   return type(value) == "number" and value > 0 and value < 1000000000
 end
 
-local function AddCandidate(candidates, value, label)
-  if IsCopper(value) then
-    table.insert(candidates, { price = math.floor(value), label = label })
-  end
+local function GetAuctionatorApi()
+  return Auctionator and Auctionator.API and Auctionator.API.v1 or nil
 end
 
-local function AddApiCandidate(candidates, fn, label, ...)
-  local ok, result = pcall(fn, ...)
-  if ok then
-    AddCandidate(candidates, result, label)
+-- === Current price ===
+
+-- Last price Auctionator has recorded for the item, through its public API.
+-- The second argument is kept for callers written against the Classic Era
+-- version and is ignored.
+function LF:GetAuctionatorPrice(itemLinkOrId)
+  local itemKey = self:GetItemKey(itemLinkOrId)
+  if not itemKey then
+    return nil
   end
+
+  self.auctionatorPriceCache = self.auctionatorPriceCache or {}
+
+  local cached = self.auctionatorPriceCache[itemKey]
+  local now = time()
+  if cached then
+    local maxAge = cached.price and AUCTIONATOR_CACHE_SECONDS or AUCTIONATOR_MISS_CACHE_SECONDS
+    if (now - cached.checkedAt) < maxAge then
+      return cached.price, cached.label
+    end
+  end
+
+  local api = GetAuctionatorApi()
+  local price, label
+  local itemId = tonumber(itemKey)
+
+  if api then
+    if type(itemLinkOrId) == "string" and string.find(itemLinkOrId, "|H", 1, true)
+      and type(api.GetAuctionPriceByItemLink) == "function" then
+      local ok, result = pcall(api.GetAuctionPriceByItemLink, LF.name, itemLinkOrId)
+      if ok and IsCopper(result) then
+        price, label = math.floor(result), "Auctionator price (link)"
+      end
+    end
+    if not price and itemId and type(api.GetAuctionPriceByItemID) == "function" then
+      local ok, result = pcall(api.GetAuctionPriceByItemID, LF.name, itemId)
+      if ok and IsCopper(result) then
+        price, label = math.floor(result), "Auctionator price"
+      end
+    end
+  end
+
+  self.auctionatorPriceCache[itemKey] = { price = price, label = label, checkedAt = now }
+
+  if price then
+    -- Only count it as one of today's observations if Auctionator actually saw
+    -- the item today; an old last-seen price says nothing about today's low.
+    local age
+    if itemId and type(api.GetAuctionAgeByItemID) == "function" then
+      local ok, result = pcall(api.GetAuctionAgeByItemID, LF.name, itemId)
+      if ok then
+        age = result
+      end
+    end
+    if age == 0 then
+      self:RecordObservation(itemKey, price, nil, nil)
+    end
+    self:Debug("Auctionator price for " .. itemKey .. ": " .. price)
+  end
+
+  return price, label
 end
 
-local function GetAuctionInfoValue(info, key, fallbackIndex)
+function LF:InvalidateAuctionatorCaches()
+  self.auctionatorPriceCache = nil
+  self.auctionatorTrendCache = nil
+  self.craftCostMemo = nil
+end
+
+-- === Scan snapshots ===
+
+local function GetInfoValue(info, key, fallbackIndex)
   if type(info) ~= "table" then
     return nil
   end
@@ -48,40 +110,33 @@ local function GetAuctionInfoValue(info, key, fallbackIndex)
   return index and info[index] or nil
 end
 
-local function NormalizeAuctionatorEntry(entry)
+-- One entry of Auctionator's replicate ("full") scan: every auction on the
+-- house with its stack size, buyout and seller.
+local function NormalizeReplicateEntry(entry)
   if type(entry) ~= "table" then
     return nil
   end
 
-  local info = entry.info or entry.auctionInfo
+  local info = entry.replicateInfo or entry.info or entry.auctionInfo
   local itemLink = entry.itemLink
-  local buyout = GetAuctionInfoValue(info, "Buyout", 10)
-  local stackSize = GetAuctionInfoValue(info, "Quantity", 3) or 1
+  local buyout = GetInfoValue(info, "Buyout", 10)
+  local stackSize = GetInfoValue(info, "Quantity", 3) or 1
 
   if not buyout or buyout <= 0 or not stackSize or stackSize <= 0 then
     return nil
   end
 
-  local itemId = GetAuctionInfoValue(info, "ItemID", 17)
+  local itemId = GetInfoValue(info, "ItemID", 17)
   if (not itemId or itemId == 0) and itemLink then
     itemId = tonumber(string.match(itemLink, "item:(%d+)"))
   end
-
-  local name = info and info[1] or nil
-  if GetItemInfo then
-    local lookup = itemLink or itemId
-    if lookup then
-      local resolvedName, resolvedLink, resolvedQuality, _, _, _, _, _, _, resolvedTexture = GetItemInfo(lookup)
-      name = name or resolvedName
-      itemLink = itemLink or resolvedLink
-      info = info or {}
-      info[2] = info[2] or resolvedTexture
-      info[4] = info[4] or resolvedQuality
-    end
+  if not itemId or itemId == 0 then
+    return nil
   end
 
-  if type(itemLink) ~= "string" or not string.find(itemLink, "item:", 1, true) or not name then
-    return nil
+  local name = info and info[1] or nil
+  if not name or name == "" then
+    name = LF:GetItemName(itemId)
   end
 
   return {
@@ -93,16 +148,16 @@ local function NormalizeAuctionatorEntry(entry)
     stackSize = stackSize,
     buyout = buyout,
     unitBuyout = math.floor(buyout / stackSize),
-    owner = GetAuctionInfoValue(info, "Owner", 14),
+    owner = GetInfoValue(info, "Owner", 14),
     quality = (info and info[4]) or 1,
   }
 end
 
-local function NormalizeAuctionatorEntries(entries)
+local function NormalizeReplicateEntries(entries)
   local auctions = {}
 
   for _, entry in ipairs(entries or {}) do
-    local auction = NormalizeAuctionatorEntry(entry)
+    local auction = NormalizeReplicateEntry(entry)
     if auction then
       table.insert(auctions, auction)
     end
@@ -111,177 +166,75 @@ local function NormalizeAuctionatorEntries(entries)
   return auctions
 end
 
-local function ScanTableForPrices(root, itemKey, depth, seen, candidates, path)
-  if type(root) ~= "table" or depth > 5 or seen[root] then
-    return
-  end
-
-  seen[root] = true
-
-  local keys = { itemKey, tonumber(itemKey), "item:" .. itemKey }
-
-  for _, lookupKey in ipairs(keys) do
-    local direct = root[lookupKey]
-    if direct ~= nil then
-      if IsCopper(direct) then
-        AddCandidate(candidates, direct, path .. "[" .. tostring(lookupKey) .. "]")
-      elseif type(direct) == "table" then
-        AddCandidate(candidates, direct.minBuyout, path .. ".minBuyout")
-        AddCandidate(candidates, direct.minbuyout, path .. ".minbuyout")
-        AddCandidate(candidates, direct.min, path .. ".min")
-        AddCandidate(candidates, direct.minimum, path .. ".minimum")
-        AddCandidate(candidates, direct.price, path .. ".price")
-        AddCandidate(candidates, direct.marketValue, path .. ".marketValue")
-        AddCandidate(candidates, direct.market, path .. ".market")
-        AddCandidate(candidates, direct.historical, path .. ".historical")
-        AddCandidate(candidates, direct.low, path .. ".low")
-        AddCandidate(candidates, direct.high, path .. ".high")
-        AddCandidate(candidates, direct.average, path .. ".average")
-        AddCandidate(candidates, direct.avg, path .. ".avg")
-      end
-    end
-  end
-
-  for key, value in pairs(root) do
-    if type(key) == "string" and string.find(string.lower(key), "auctionator", 1, true) then
-      ScanTableForPrices(value, itemKey, depth + 1, seen, candidates, path .. "." .. key)
-    elseif depth > 0 and depth < 2 and type(value) == "table" then
-      ScanTableForPrices(value, itemKey, depth + 1, seen, candidates, path .. "." .. tostring(key))
-    end
-  end
-end
-
-local function ScanAuctionatorGlobals(itemKey, candidates)
-  local roots = {
-    "Auctionator",
-    "AUCTIONATOR_PRICE_DATABASE",
-    "AUCTIONATOR_HISTORY_DATABASE",
-    "AuctionatorPriceDatabase",
-    "AuctionatorHistoryDatabase",
-  }
-
-  local seen = {}
-  for _, name in ipairs(roots) do
-    if type(_G[name]) == "table" then
-      ScanTableForPrices(_G[name], itemKey, 0, seen, candidates, name)
-    end
-  end
-
-  for name, value in pairs(_G) do
-    local lowerName = type(name) == "string" and string.lower(name) or ""
-    local looksLikePriceData = string.find(lowerName, "price", 1, true)
-      or string.find(lowerName, "database", 1, true)
-      or string.find(lowerName, "history", 1, true)
-    if type(value) == "table" and string.find(lowerName, "auctionator", 1, true) and looksLikePriceData then
-      ScanTableForPrices(value, itemKey, 0, seen, candidates, name)
-    end
-  end
-end
-
-function LF:GetAuctionatorPrice(itemLinkOrId, allowSavedVariableScan)
-  local itemKey = self:GetItemKey(itemLinkOrId)
-  if not itemKey then
-    return nil
-  end
-
-  self.auctionatorPriceCache = self.auctionatorPriceCache or {}
-
-  local cached = self.auctionatorPriceCache[itemKey]
-  local now = time()
-  if cached then
-    if allowSavedVariableScan == false then
-      if cached.price or (now - cached.checkedAt) < AUCTIONATOR_MISS_CACHE_SECONDS then
-        return cached.price, cached.label
-      end
-    end
-    if cached.price and (now - cached.checkedAt) < AUCTIONATOR_CACHE_SECONDS then
-      return cached.price, cached.label
-    end
-  end
-
-  local candidates = {}
-
-  if Auctionator and Auctionator.API and Auctionator.API.v1 then
-    local api = Auctionator.API.v1
-    if type(api.GetAuctionPriceByItemLink) == "function" and type(itemLinkOrId) == "string" then
-      AddApiCandidate(candidates, api.GetAuctionPriceByItemLink, "Auctionator.API.v1.GetAuctionPriceByItemLink", LF.name, itemLinkOrId)
-    end
-    if type(api.GetAuctionPriceByItemID) == "function" then
-      AddApiCandidate(candidates, api.GetAuctionPriceByItemID, "Auctionator.API.v1.GetAuctionPriceByItemID", LF.name, tonumber(itemKey))
-    end
-  end
-
-  if allowSavedVariableScan ~= false then
-    ScanAuctionatorGlobals(itemKey, candidates)
-  end
-
-  table.sort(candidates, function(left, right)
-    return left.price < right.price
-  end)
-
-  local best = candidates[1]
-  if best then
-    self.auctionatorPriceCache[itemKey] = {
-      price = best.price,
-      label = best.label,
-      checkedAt = now,
-    }
-    self:RecordObservation(itemKey, best.price, nil, nil)
-    self:Debug("Auctionator price for " .. itemKey .. ": " .. best.price .. " from " .. best.label)
-    return best.price, best.label
-  end
-
-  self.auctionatorPriceCache[itemKey] = {
-    checkedAt = now,
-  }
-
-  return nil
-end
-
-function LF:SaveAuctionatorScanSnapshot(entries, complete, recordHistory, sourceLabel, preferForDeals)
-  if not self.db then
+-- Stores a set of auction rows as the saved LiteFlipper snapshot (what
+-- /lf scan and /lf browse fall back to) and feeds them into price history.
+--
+-- A small result set never replaces a saved full scan - it would throw away
+-- the whole-market view for the sake of one search - but its prices are still
+-- recorded, so history and "current low" stay fresh between full scans.
+function LF:SaveScanSnapshot(auctions, options)
+  if not self.db or type(auctions) ~= "table" or #auctions == 0 then
     return false
   end
+  options = options or {}
 
-  local auctions = NormalizeAuctionatorEntries(entries)
-  if #auctions == 0 then
-    return false
-  end
-
-  if not preferForDeals
+  if not options.preferForDeals
     and self.lastScan
     and self.lastScan.preferForDeals
     and #auctions < math.max(50, math.floor((self.lastScan.count or #self.lastScan.auctions or 0) * 0.25)) then
-    self:Debug("Ignored smaller Auctionator search snapshot with " .. #auctions .. " auction(s).")
+    if options.recordHistory and self.ObserveAuctions then
+      self:ObserveAuctions(auctions)
+    end
+    self:Debug("Kept the saved full scan; learned prices from " .. #auctions .. " new row(s).")
     return false
   end
 
   self.lastScan = {
     auctions = auctions,
-    count = #auctions,
+    count = options.count or #auctions,
     scannedAt = time(),
-    sourceLabel = sourceLabel or AUCTIONATOR_SEARCH_SOURCE,
-    complete = complete and true or false,
-    historyRecorded = recordHistory and true or false,
-    preferForDeals = preferForDeals and true or false,
+    sourceLabel = options.sourceLabel or "Saved scan",
+    complete = options.complete and true or false,
+    historyRecorded = false,
+    preferForDeals = options.preferForDeals and true or false,
+    summary = options.summary and true or false,
   }
+  local scan = self.lastScan
 
-  if recordHistory and self.RecordAuctionObservationsAsync then
+  -- A whole-house scan supersedes everything seen before it, including items
+  -- that have since sold out. A partial result set says nothing about the
+  -- items it does not contain, so their fresher lows are kept.
+  if options.preferForDeals then
+    local recentLows = self:GetRecentLows()
+    for itemKey in pairs(recentLows) do
+      recentLows[itemKey] = nil
+    end
+  end
+
+  if options.recordHistory and self.RecordAuctionObservationsAsync then
     self:RecordAuctionObservationsAsync(auctions, function()
-      if self.lastScan and self.lastScan.auctions == auctions then
-        self.lastScan.historyRecorded = true
-        self:SaveLastScan()
-      end
+      scan.historyRecorded = true
     end)
-  elseif recordHistory and self.RecordAuctionObservations then
-    self:RecordAuctionObservations(auctions)
   end
 
   self:SaveLastScan()
-  self:Debug("Saved latest Auctionator snapshot with " .. #auctions .. " buyout auction(s).")
+  self:Debug("Saved snapshot with " .. #auctions .. " row(s) from " .. scan.sourceLabel .. ".")
   return true
 end
 
+function LF:SaveAuctionatorScanSnapshot(entries, complete, recordHistory, sourceLabel, preferForDeals)
+  return self:SaveScanSnapshot(NormalizeReplicateEntries(entries), {
+    sourceLabel = sourceLabel or AUCTIONATOR_FULL_SCAN_SOURCE,
+    complete = complete,
+    recordHistory = recordHistory,
+    preferForDeals = preferForDeals,
+  })
+end
+
+-- Auctionator has two kinds of whole-house scan on this client. The default
+-- one pages through the browse list and yields one row per item (lowest price
+-- and total quantity); the optional "replicate" one yields every auction.
+-- LiteFlipper listens for both finishing and keeps the result as its snapshot.
 function LF:InstallAuctionatorScanListener()
   if self.auctionatorScanListenerInstalled then
     return true
@@ -291,70 +244,70 @@ function LF:InstallAuctionatorScanListener()
     return false
   end
 
+  local incremental = Auctionator.IncrementalScan and Auctionator.IncrementalScan.Events or {}
+  local replicate = Auctionator.FullScan and Auctionator.FullScan.Events or {}
+
   local events = {}
-  if Auctionator.AH and Auctionator.AH.Events then
-    if Auctionator.AH.Events.ScanPageStart then
-      table.insert(events, Auctionator.AH.Events.ScanPageStart)
-    end
-    if Auctionator.AH.Events.ScanResultsUpdate then
-      table.insert(events, Auctionator.AH.Events.ScanResultsUpdate)
-    end
-    if Auctionator.AH.Events.ScanAborted then
-      table.insert(events, Auctionator.AH.Events.ScanAborted)
+  local function Add(eventName)
+    if eventName then
+      table.insert(events, eventName)
     end
   end
-  if Auctionator.FullScan and Auctionator.FullScan.Events then
-    if Auctionator.FullScan.Events.ScanComplete then
-      table.insert(events, Auctionator.FullScan.Events.ScanComplete)
-    end
-  end
+  Add(incremental.ScanStart)
+  Add(incremental.ScanComplete)
+  Add(incremental.ScanFailed)
+  Add(incremental.PricesProcessed)
+  Add(replicate.ScanStart)
+  Add(replicate.ScanComplete)
+  Add(replicate.ScanFailed)
 
   if #events == 0 then
     return false
   end
 
-  local listener = {
-    pending = {},
-  }
+  local listener = {}
 
-  function listener:ReceiveEvent(eventName, results, complete)
-    if Auctionator.AH and Auctionator.AH.Events then
-      if eventName == Auctionator.AH.Events.ScanPageStart then
-        -- Pages within one query arrive sequentially (0, 1, 2, ...). Anything
-        -- else (a new search, or a focused single-page query from the buying
-        -- tab) starts a fresh snapshot instead of appending to stale results.
-        local page = tonumber(results)
-        if not page or page == 0 or page ~= (self.lastPage or -1) + 1 then
-          self.pending = {}
-        end
-        self.lastPage = page or 0
-        return
-      elseif eventName == Auctionator.AH.Events.ScanResultsUpdate then
-        for _, entry in ipairs(results or {}) do
-          table.insert(self.pending, entry)
-        end
-
-        LF:SaveAuctionatorScanSnapshot(self.pending, complete, complete, AUCTIONATOR_SEARCH_SOURCE, false)
-        return
-      elseif eventName == Auctionator.AH.Events.ScanAborted then
-        LF:SaveAuctionatorScanSnapshot(self.pending, true, true, AUCTIONATOR_SEARCH_SOURCE, false)
-        return
-      end
-    end
-
-    if Auctionator.FullScan and Auctionator.FullScan.Events
-      and eventName == Auctionator.FullScan.Events.ScanComplete then
-      self.pending = {}
-      LF:SaveAuctionatorScanSnapshot(results, true, true, AUCTIONATOR_FULL_SCAN_SOURCE, true)
+  function listener:ReceiveEvent(eventName, payload)
+    if eventName == incremental.ScanStart or eventName == replicate.ScanStart then
+      -- While Auctionator pages through the whole house, the per-page browse
+      -- events are noise; the finished scan arrives in one piece below.
+      LF.auctionatorScanActive = true
+    elseif eventName == incremental.ScanFailed or eventName == replicate.ScanFailed then
+      LF.auctionatorScanActive = false
+    elseif eventName == incremental.ScanComplete then
+      LF.auctionatorScanActive = false
+      LF:InvalidateAuctionatorCaches()
+      local auctions = LF.BrowseResultsToAuctions and LF:BrowseResultsToAuctions(payload) or {}
+      LF:SaveScanSnapshot(auctions, {
+        sourceLabel = AUCTIONATOR_SUMMARY_SCAN_SOURCE,
+        complete = true,
+        recordHistory = true,
+        preferForDeals = true,
+        summary = true,
+      })
+    elseif eventName == replicate.ScanComplete then
+      LF.auctionatorScanActive = false
+      LF:InvalidateAuctionatorCaches()
+      LF:SaveAuctionatorScanSnapshot(payload, true, true, AUCTIONATOR_FULL_SCAN_SOURCE, true)
+    elseif eventName == incremental.PricesProcessed then
+      -- Auctionator just updated its price database from a search.
+      LF:InvalidateAuctionatorCaches()
     end
   end
 
-  Auctionator.EventBus:Register(listener, events)
+  local ok, errorMessage = pcall(Auctionator.EventBus.Register, Auctionator.EventBus, listener, events)
+  if not ok then
+    self:Debug("Could not listen for Auctionator scans: " .. tostring(errorMessage))
+    return false
+  end
+
   self.auctionatorScanListener = listener
   self.auctionatorScanListenerInstalled = true
   self:Debug("Listening for Auctionator scan snapshots.")
   return true
 end
+
+-- === LiteFlipper's own day buckets ===
 
 function LF:RecordObservation(itemKey, minPrice, highPrice, lowPrice)
   if not itemKey or not IsCopper(minPrice) then
@@ -380,14 +333,52 @@ function LF:RecordObservation(itemKey, minPrice, highPrice, lowPrice)
   history[itemKey][day] = bucket
 end
 
-local function GetAuctionatorItemData(itemKey)
+function LF:RecordSupplySnapshot(itemKey, auctionCount, unitCount)
+  if not itemKey or type(auctionCount) ~= "number" or auctionCount <= 0 then
+    return
+  end
+
+  local history = self:GetHistory()
+  history[itemKey] = history[itemKey] or {}
+
+  local day = tostring(Today())
+  local bucket = history[itemKey][day] or { seen = 0 }
+  bucket.supplyAuctions = bucket.supplyAuctions and math.max(bucket.supplyAuctions, auctionCount) or auctionCount
+  bucket.supplyUnits = bucket.supplyUnits and math.max(bucket.supplyUnits, unitCount or auctionCount) or (unitCount or auctionCount)
+  bucket.lastSupplyScan = time()
+
+  history[itemKey][day] = bucket
+end
+
+-- === Auctionator's daily price history ===
+
+-- Auctionator numbers its history days from local midnight on 1 January 2020.
+function LF:GetAuctionatorDayZero()
+  local constants = Auctionator and Auctionator.Constants
+  if constants and type(constants.SCAN_DAY_0) == "number" then
+    return constants.SCAN_DAY_0
+  end
+  if not self.fallbackDayZero then
+    self.fallbackDayZero = time({ year = 2020, month = 1, day = 1, hour = 0 })
+  end
+  return self.fallbackDayZero
+end
+
+function LF:GetAuctionatorDay(timestamp)
+  return math.floor(((timestamp or time()) - self:GetAuctionatorDayZero()) / DAY_SECONDS)
+end
+
+-- Auctionator has no public call for its price history, so this reads the
+-- in-memory database directly and checks every step: if a future Auctionator
+-- changes the layout, history quietly becomes unavailable instead of erroring.
+local function GetAuctionatorItemData(dbKey)
   local database = Auctionator and Auctionator.Database
   local db = database and database.db
   if type(db) ~= "table" then
     return nil
   end
 
-  local data = db[tostring(itemKey)]
+  local data = db[tostring(dbKey)]
   if type(data) ~= "table" or type(data.h) ~= "table" then
     return nil
   end
@@ -395,15 +386,18 @@ local function GetAuctionatorItemData(itemKey)
   return data
 end
 
--- Reads the per-day price history Auctionator keeps for its History button
--- (21 days by default). Auctionator records the day's minimum listing price,
--- tracked as the lowest (l) and highest (h) minimum seen that day, plus the
--- largest quantity available (a). Returns points oldest first:
--- { age (days ago), low, high, typical, available }.
-function LF:GetAuctionatorHistory(itemLinkOrId, maxDays)
-  local itemKey = self:GetItemKey(itemLinkOrId)
-  local dayZero = Auctionator and Auctionator.Constants and Auctionator.Constants.SCAN_DAY_0
-  if not itemKey or not dayZero then
+-- Reads the per-day price history Auctionator keeps (21 days by default).
+-- Auctionator records the day's minimum listing price, tracked as the lowest
+-- (l) and highest (h) minimum seen that day, plus the largest quantity
+-- available (a). Returns points oldest first:
+-- { age (days ago), rawDay, low, high, typical, available }.
+--
+-- dbKey is optional: Auctionator files random-suffix gear under a more
+-- specific key as well as the plain item id, and the history window passes
+-- that key when it knows it.
+function LF:GetAuctionatorHistory(itemLinkOrId, maxDays, dbKey)
+  local itemKey = dbKey or self:GetItemKey(itemLinkOrId)
+  if not itemKey then
     return nil
   end
 
@@ -412,7 +406,7 @@ function LF:GetAuctionatorHistory(itemLinkOrId, maxDays)
     return nil
   end
 
-  local todayRaw = math.floor((time() - dayZero) / DAY_SECONDS)
+  local todayRaw = self:GetAuctionatorDay()
   local points = {}
 
   for day, high in pairs(data.h) do
@@ -422,6 +416,7 @@ function LF:GetAuctionatorHistory(itemLinkOrId, maxDays)
       local low = (type(data.l) == "table" and IsCopper(data.l[day]) and data.l[day]) or high
       table.insert(points, {
         age = age,
+        rawDay = rawDay,
         low = low,
         high = high,
         typical = math.floor((low + high) / 2),
@@ -439,6 +434,10 @@ function LF:GetAuctionatorHistory(itemLinkOrId, maxDays)
   end)
 
   return points
+end
+
+function LF:HasAuctionatorHistory(dbKey)
+  return GetAuctionatorItemData(dbKey) ~= nil
 end
 
 -- Market value from Auctionator's recorded daily prices, for items we have
@@ -570,21 +569,4 @@ function LF:DescribeVolatility(volatility)
     return "Medium", percent
   end
   return "High", percent
-end
-
-function LF:RecordSupplySnapshot(itemKey, auctionCount, unitCount)
-  if not itemKey or type(auctionCount) ~= "number" or auctionCount <= 0 then
-    return
-  end
-
-  local history = self:GetHistory()
-  history[itemKey] = history[itemKey] or {}
-
-  local day = tostring(Today())
-  local bucket = history[itemKey][day] or { seen = 0 }
-  bucket.supplyAuctions = bucket.supplyAuctions and math.max(bucket.supplyAuctions, auctionCount) or auctionCount
-  bucket.supplyUnits = bucket.supplyUnits and math.max(bucket.supplyUnits, unitCount or auctionCount) or (unitCount or auctionCount)
-  bucket.lastSupplyScan = time()
-
-  history[itemKey][day] = bucket
 end

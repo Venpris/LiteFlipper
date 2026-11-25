@@ -4,7 +4,7 @@ local LF = {}
 ns.LF = LF
 
 LF.name = ADDON_NAME
-LF.version = "0.1.0"
+LF.version = "0.2.0"
 
 local DEFAULTS = {
   daysToAverage = 7,
@@ -19,8 +19,11 @@ local DEFAULTS = {
   debug = false,
   historyByScope = {},
   lastScans = {},
+  recentLows = {},
   craftRecipes = {},
+  knownRecipes = {},
   vendorPrices = {},
+  itemNames = {},
 }
 
 local function CopyDefaults(target, defaults)
@@ -53,6 +56,7 @@ function LF:FormatMoney(copper)
   if not copper or copper < 0 then
     return "-"
   end
+  copper = math.floor(copper + 0.5)
   if copper == 0 then
     return "0c"
   end
@@ -95,24 +99,64 @@ local function NormalizeRealmName(realm)
   return (string.gsub(tostring(realm), "[%s%-']", ""))
 end
 
+-- WoW Forever has region-wide character names, and its auction houses are
+-- shared by every realm with the same ruleset rather than split per realm. In
+-- that case the ruleset is what identifies a market, not the realm name.
+local function GetRulesetName()
+  if not (RegionalUniqueNamesEnabled and RegionalUniqueNamesEnabled()) then
+    return nil
+  end
+
+  local rules = C_GameRules
+  local rule = Enum and Enum.GameRule
+  if not (rules and rules.IsGameRuleActive and rule) then
+    return nil
+  end
+
+  local function IsActive(id)
+    if id == nil then
+      return false
+    end
+    local ok, active = pcall(rules.IsGameRuleActive, id)
+    return ok and active and true or false
+  end
+
+  local pvp = IsActive(rule.PvPRuleset)
+  local rp = IsActive(rule.RPRuleset)
+  if pvp and rp then
+    return "RPPvP"
+  elseif pvp then
+    return "PvP"
+  elseif rp then
+    return "RP"
+  elseif IsActive(rule.HardcoreRuleset) then
+    return "HC"
+  end
+  return "PvE"
+end
+
 function LF:GetMarketScopeKey()
   if self.marketScopeKey then
     return self.marketScopeKey
   end
 
-  local realm = (GetNormalizedRealmName and GetNormalizedRealmName())
-    or (GetRealmName and GetRealmName())
-  local localizedFaction, englishFaction
-  if UnitFactionGroup then
-    localizedFaction, englishFaction = UnitFactionGroup("player")
+  local market = GetRulesetName()
+  if not market then
+    local realm = (GetNormalizedRealmName and GetNormalizedRealmName())
+      or (GetRealmName and GetRealmName())
+    if realm and realm ~= "" then
+      market = NormalizeRealmName(realm)
+    end
   end
-  local faction = englishFaction or localizedFaction
 
-  if not realm or realm == "" or not faction then
+  -- The first return is the non-localized tag ("Alliance" / "Horde").
+  local faction = UnitFactionGroup and UnitFactionGroup("player") or nil
+
+  if not market or not faction or faction == "" then
     return nil
   end
 
-  self.marketScopeKey = NormalizeRealmName(realm) .. "::" .. tostring(faction)
+  self.marketScopeKey = market .. "::" .. tostring(faction)
   return self.marketScopeKey
 end
 
@@ -132,36 +176,29 @@ function LF:GetHistory()
   return self.db.historyByScope[scopeKey]
 end
 
+-- Lowest price seen per item in result sets that arrived after the saved scan
+-- (a search, or an item opened in the buy panel). Keeps "current low" fresh
+-- between full scans. [itemKey] = { p = copper, t = time }.
+function LF:GetRecentLows()
+  if not self.db then
+    return {}
+  end
+
+  local scopeKey = self:GetMarketScopeKey()
+  if not scopeKey then
+    self.transientRecentLows = self.transientRecentLows or {}
+    return self.transientRecentLows
+  end
+
+  self.db.recentLows = self.db.recentLows or {}
+  self.db.recentLows[scopeKey] = self.db.recentLows[scopeKey] or {}
+  return self.db.recentLows[scopeKey]
+end
+
 function LF:MigrateDatabase()
   local scopeKey = self:GetMarketScopeKey()
   if not self.db or not scopeKey then
     return
-  end
-
-  -- Re-key snapshots saved before realm names were normalized, so data written
-  -- on a fresh login (localized realm name) is found again after a reload.
-  self.db.lastScans = self.db.lastScans or {}
-  for key, scan in pairs(self.db.lastScans) do
-    local realm, faction = string.match(key, "^(.-)::(.*)$")
-    if realm and faction then
-      local normalizedKey = NormalizeRealmName(realm) .. "::" .. faction
-      if normalizedKey ~= key then
-        local existing = self.db.lastScans[normalizedKey]
-        if not existing or (scan.scannedAt or 0) > (existing.scannedAt or 0) then
-          self.db.lastScans[normalizedKey] = scan
-        end
-        self.db.lastScans[key] = nil
-      end
-    end
-  end
-
-  -- Move the old account-wide history under this realm/faction.
-  self.db.historyByScope = self.db.historyByScope or {}
-  if type(self.db.history) == "table" then
-    if next(self.db.history) and not self.db.historyByScope[scopeKey] then
-      self.db.historyByScope[scopeKey] = self.db.history
-    end
-    self.db.history = nil
   end
 
   -- Fold any history recorded before the scope key was known into this scope.
@@ -228,6 +265,9 @@ function LF:SaveLastScan()
     self:BuildLastScanIndex()
   end
 
+  -- Prices changed, so cached craft costs are stale.
+  self.craftCostMemo = nil
+
   local scopeKey = self:GetMarketScopeKey()
   if not scopeKey then
     return
@@ -269,6 +309,7 @@ local PROFESSION_SHORTCUTS = {
   bs = "blacksmithing",
   lw = "leatherworking",
   tailor = "tailoring",
+  cook = "cooking",
 }
 
 function LF:ApplySettings(args)
@@ -335,7 +376,7 @@ function LF:ApplySettings(args)
   elseif command == "purge" then
     local hours = tonumber(value)
     if not hours or hours <= 0 then
-      self:Print("Usage: /lf purge 3 - delete market history older than 3 hours (this realm/faction only)")
+      self:Print("Usage: /lf purge 3 - delete market history older than 3 hours (this auction house only)")
       return
     end
     local removedSamples, clearedItems = self:PurgeHistoryBefore(time() - hours * 3600)
@@ -360,7 +401,9 @@ function LF:ApplySettings(args)
     self:Print("Debug " .. (self.db.debug and "enabled." or "disabled."))
   elseif command == "price" or command == "search" or command == "value" then
     self:PriceLookup(value)
-  elseif command == "trend" or command == "history" then
+  elseif command == "history" or command == "hist" then
+    self:HistoryLookup(value)
+  elseif command == "trend" then
     self:TrendLookup(value)
   elseif command == "bags" or command == "bag" then
     self:BagScan()
@@ -380,13 +423,14 @@ function LF:ApplySettings(args)
       self:ScanAuctionHouse()
     end
   elseif command == "help" then
-    self:Print("/lf scan - find deals in current auction results, or show the saved scan if no current rows are available")
+    self:Print("/lf scan - find deals in the current auction results, or in the saved scan if nothing is on screen")
     self:Print("/lf browse - show auction rows without threshold, profit, or supply filters")
-    self:Print("/lf craft alchemy - rank recorded alchemy recipes by crafting profit (also /lf scan alchemy)")
-    self:Print("/lf alch | eng | ench | bs | lw | tailor - open that profession's crafting results")
-    self:Print("/lf craft - list professions with recorded recipes")
+    self:Print("/lf history silk - open the day-by-day price history window for an item")
     self:Print("/lf price silk - look up saved prices, trend, and historical low/high for matching items")
-    self:Print("/lf trend silk - price trend, volatility, low/high, and day-by-day history from Auctionator's price database")
+    self:Print("/lf trend silk - price trend, volatility, and low/high in chat")
+    self:Print("/lf craft alchemy - rank alchemy recipes by crafting profit (also /lf scan alchemy)")
+    self:Print("/lf alch | eng | ench | bs | lw | tailor | cook - open that profession's crafting results")
+    self:Print("/lf craft - list professions with recipe data")
     self:Print("/lf bags - value the sellable items in your bags")
     self:Print("/lf uses briarthorn - show crafts that use a material and their margins")
     self:Print("/lf tree copper tube - open the buy-vs-craft material tree planner")
@@ -394,9 +438,8 @@ function LF:ApplySettings(args)
     self:Print("/lf minthreshold 10 - ignore auctions below 10% of market (0 disables)")
     self:Print("/lf profit 1 - require at least 1g estimated profit")
     self:Print("/lf supply 5 - require at least 5 visible units in the scan, or 0 to disable")
-    self:Print("/lf purge 3 - delete market history older than 3 hours (this realm/faction only)")
-    self:Print("/lf hovertooltip - toggle LiteFlipper market/trend lines on item hover tooltips (also /lf tooltip)")
-    self:Print("/lf hovertooltip on|off - explicitly show or hide those item-hover lines")
+    self:Print("/lf purge 3 - delete market history older than 3 hours (this auction house only)")
+    self:Print("/lf hovertooltip [on|off] - toggle LiteFlipper lines on item tooltips (also /lf tooltip)")
   else
     self:Print("Unknown command. Try /lf help.")
   end
@@ -407,12 +450,18 @@ frame:RegisterEvent("ADDON_LOADED")
 frame:RegisterEvent("PLAYER_LOGIN")
 frame:SetScript("OnEvent", function(_, event, addonName)
   if event == "PLAYER_LOGIN" then
-    -- Realm and faction are reliable here, unlike at ADDON_LOADED, so this is
-    -- the earliest point the realm::faction scope key is stable.
+    -- Faction and game rules are reliable here, unlike at ADDON_LOADED, so
+    -- this is the earliest point the market scope key is stable.
     if LF.db then
       LF:MigrateDatabase()
       LF:PruneHistory()
       LF:RestoreLastScan()
+      if LF.InstallAuctionatorScanListener then
+        LF:InstallAuctionatorScanListener()
+      end
+      if LF.WarmItemNames then
+        LF:WarmItemNames()
+      end
     end
     return
   end
@@ -441,6 +490,9 @@ frame:SetScript("OnEvent", function(_, event, addonName)
     LF:CreateCraftTreeFrame()
   end
   LF:CreateBagFrame()
+  if LF.CreateHistoryFrame then
+    LF:CreateHistoryFrame()
+  end
   if LF.InstallAuctionatorScanListener then
     LF:InstallAuctionatorScanListener()
   end
@@ -451,5 +503,5 @@ frame:SetScript("OnEvent", function(_, event, addonName)
     LF:ApplySettings(args)
   end
 
-  LF:Print("Loaded. Use /lf scan after an Auctionator or auction house search.")
+  LF:Print("Loaded. Use /lf scan after an Auctionator scan or an auction house search, or /lf help.")
 end)

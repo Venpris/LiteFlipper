@@ -5,6 +5,11 @@ local DAY_SECONDS = 86400
 local MAX_SCAN_SAMPLES_PER_DAY = 80
 local OUTLIER_LOW_MULTIPLIER = 0.50
 local OUTLIER_HIGH_MULTIPLIER = 2.00
+-- Result sets that arrive this close together describe the same market moment
+-- (a search listing followed by the item's own price ladder, or a refresh), so
+-- they count as one sample instead of piling up.
+local SAMPLE_MERGE_SECONDS = 300
+local RECENT_LOW_MAX_AGE_SECONDS = 3 * DAY_SECONDS
 
 local function Today()
   return math.floor(time() / DAY_SECONDS)
@@ -119,10 +124,14 @@ local function ScanSampleAverage(history, daysToAverage)
 
   local samples = {}
   local today = Today()
+  local daysWithSamples = 0
 
   for offset = 0, daysToAverage - 1 do
     local bucket = history[tostring(today - offset)]
     if bucket and type(bucket.scans) == "table" then
+      if #bucket.scans > 0 then
+        daysWithSamples = daysWithSamples + 1
+      end
       for _, sample in ipairs(bucket.scans) do
         if sample and type(sample.prices) == "table" then
           for _, price in ipairs(sample.prices) do
@@ -137,7 +146,8 @@ local function ScanSampleAverage(history, daysToAverage)
     end
   end
 
-  return LF:GetRobustMarketAverage(samples)
+  local average, included = LF:GetRobustMarketAverage(samples)
+  return average, included, daysWithSamples
 end
 
 local function CapToHistoricalHigh(value, itemLinkOrId)
@@ -163,17 +173,27 @@ function LF:GetMarketValue(itemLinkOrId, allowSavedVariableScan)
   local today = Today()
   local daysToAverage = self.db.daysToAverage or 7
 
-  local scanAverage, scanCount = ScanSampleAverage(history, daysToAverage)
-  if scanAverage then
+  local scanAverage, scanCount, scanDays = ScanSampleAverage(history, daysToAverage)
+  local historyValue, historyDays = self:GetAuctionatorHistoryValue(itemLinkOrId)
+
+  -- LiteFlipper's own samples are the richer source (they include whole price
+  -- ladders, not just the cheapest listing), so they win whenever they cover
+  -- at least as many days as Auctionator's record. Until then - a fresh
+  -- install next to an Auctionator that has been scanning for a while -
+  -- Auctionator's multi-day history is the better picture of the market than
+  -- one or two samples of today's price.
+  if scanAverage and not (historyValue and (historyDays or 0) > (scanDays or 0)) then
     local cappedAverage, capped = CapToHistoricalHigh(scanAverage, itemLinkOrId)
     return cappedAverage, scanCount, capped and "scan-capped" or "scan"
   end
 
-  -- Auctionator's own daily history is a multi-day average, so prefer it
-  -- over the single last-seen spot price below.
-  local historyValue, historyDays = self:GetAuctionatorHistoryValue(itemLinkOrId)
   if historyValue then
     return historyValue, historyDays, "ah-history"
+  end
+
+  if scanAverage then
+    local cappedAverage, capped = CapToHistoricalHigh(scanAverage, itemLinkOrId)
+    return cappedAverage, scanCount, capped and "scan-capped" or "scan"
   end
 
   local auctionatorPrice = self:GetAuctionatorPrice(itemLinkOrId, allowSavedVariableScan)
@@ -229,7 +249,17 @@ function LF:RecordScanPriceSample(itemKey, averagePrice, auctionCount, unitCount
     end
   end
 
-  table.insert(bucket.scans, scan)
+  local previous = bucket.scans[#bucket.scans]
+  if previous and (scan.time - (previous.time or 0)) < SAMPLE_MERGE_SECONDS then
+    -- Same market moment: keep whichever sample saw more of the listings.
+    local previousCount = type(previous.prices) == "table" and #previous.prices or 1
+    local newCount = scan.prices and #scan.prices or 1
+    if newCount >= previousCount then
+      bucket.scans[#bucket.scans] = scan
+    end
+  else
+    table.insert(bucket.scans, scan)
+  end
 
   while #bucket.scans > MAX_SCAN_SAMPLES_PER_DAY do
     table.remove(bucket.scans, 1)
@@ -266,6 +296,17 @@ function LF:PruneHistory()
   for _, store in pairs(self.db.historyByScope or {}) do
     if type(store) == "table" then
       PruneStore(store)
+    end
+  end
+
+  local cutoff = time() - RECENT_LOW_MAX_AGE_SECONDS
+  for _, lows in pairs(self.db.recentLows or {}) do
+    if type(lows) == "table" then
+      for itemKey, low in pairs(lows) do
+        if type(low) ~= "table" or (low.t or 0) < cutoff then
+          lows[itemKey] = nil
+        end
+      end
     end
   end
 end
@@ -421,17 +462,30 @@ function LF:GetPricePosition(itemLinkOrId, currentUnitBuyout)
   return label, recentLow, aboveLow, observedDays
 end
 
+-- Lowest price LiteFlipper has seen for the item most recently: from the saved
+-- scan, or from a newer search / buy-panel result set if there is one.
 function LF:GetLatestScanMinPrice(itemLinkOrId)
   local itemKey = self:GetItemKey(itemLinkOrId)
-  if not itemKey or not self.lastScan or type(self.lastScan.auctions) ~= "table" then
+  if not itemKey then
     return nil
   end
+  itemKey = tostring(itemKey)
 
-  if not self.lastScanMinPrices and self.BuildLastScanIndex then
-    self:BuildLastScanIndex()
+  local scanPrice, scanTime
+  if self.lastScan and type(self.lastScan.auctions) == "table" then
+    if not self.lastScanMinPrices and self.BuildLastScanIndex then
+      self:BuildLastScanIndex()
+    end
+    scanPrice = self.lastScanMinPrices and self.lastScanMinPrices[itemKey] or nil
+    scanTime = self.lastScan.scannedAt or 0
   end
 
-  return self.lastScanMinPrices and self.lastScanMinPrices[tostring(itemKey)] or nil
+  local recent = self:GetRecentLows()[itemKey]
+  if type(recent) == "table" and recent.p and (not scanPrice or (recent.t or 0) >= scanTime) then
+    return recent.p
+  end
+
+  return scanPrice
 end
 
 local function AddPriceMatch(matches, seen, itemId, name)
@@ -456,37 +510,54 @@ function LF:FindItemsByQuery(query)
 
   local directKey = self:GetItemKey(query)
   if directKey then
-    local name = GetItemInfo and GetItemInfo(tonumber(directKey)) or nil
+    local name = self:GetItemName(tonumber(directKey))
     AddPriceMatch(matches, seen, directKey, name or ("item " .. directKey))
     return matches
   end
 
   local lowered = string.lower(query)
 
-  if GetItemInfo then
-    local name, link = GetItemInfo(query)
-    if name and link then
-      local itemId = self:GetItemKey(link)
-      if itemId then
-        AddPriceMatch(matches, seen, itemId, name)
-      end
+  -- The client resolves an exact item name on its own if it has it cached.
+  local exactName, exactLink = self:GetItemInfo(query)
+  if exactName and exactLink then
+    local itemId = self:GetItemKey(exactLink)
+    if itemId then
+      AddPriceMatch(matches, seen, itemId, exactName)
     end
   end
 
   if self.lastScan and type(self.lastScan.auctions) == "table" then
     for _, auction in ipairs(self.lastScan.auctions) do
       local itemId = auction.itemId or self:GetItemKey(auction.itemLink)
-      if itemId and auction.name and string.find(string.lower(auction.name), lowered, 1, true) then
-        AddPriceMatch(matches, seen, itemId, auction.name)
+      if itemId then
+        -- Summary scans can be saved before the client knew every name.
+        local name = auction.name or self:GetItemName(itemId, true)
+        if name and string.find(string.lower(name), lowered, 1, true) then
+          auction.name = auction.name or name
+          AddPriceMatch(matches, seen, itemId, name)
+        end
       end
     end
   end
 
   for _, profession in pairs(ns.RecipeData or {}) do
     for _, entry in ipairs(profession.recipes or {}) do
-      if string.find(string.lower(entry.n), lowered, 1, true) then
-        AddPriceMatch(matches, seen, entry.p, entry.n)
+      local name = entry.n or self:GetItemName(entry.p, true)
+      if name and string.find(string.lower(name), lowered, 1, true) then
+        AddPriceMatch(matches, seen, entry.p, name)
       end
+    end
+  end
+
+  -- Reagents and other items whose names are bundled or were learned in game.
+  for itemId, name in pairs(ns.ItemNames or {}) do
+    if string.find(string.lower(name), lowered, 1, true) then
+      AddPriceMatch(matches, seen, itemId, name)
+    end
+  end
+  for itemId, name in pairs((self.db and self.db.itemNames) or {}) do
+    if type(name) == "string" and string.find(string.lower(name), lowered, 1, true) then
+      AddPriceMatch(matches, seen, itemId, name)
     end
   end
 
@@ -534,12 +605,12 @@ function LF:PriceLookup(query)
   local MAX_RESULTS = 8
   for index = 1, math.min(#matches, MAX_RESULTS) do
     local match = matches[index]
-    local link = GetItemInfo and select(2, GetItemInfo(match.itemId)) or nil
+    local link = self:GetItemLink(match.itemId)
     local label = link or match.name
 
     local marketValue, _, source = self:GetMarketValue(match.itemId)
     local current = self:GetLatestScanMinPrice(match.itemId)
-    local vendor = self.db and self.db.vendorPrices and self.db.vendorPrices[tostring(match.itemId)]
+    local vendor = self:GetVendorPrice(match.itemId)
 
     local parts = {}
     if marketValue then
@@ -574,8 +645,8 @@ function LF:PriceLookup(query)
 end
 
 -- "/lf trend <item>" - trend, volatility, historical low/high, and the
--- day-by-day price history Auctionator has recorded (the same data behind
--- its History button).
+-- day-by-day price history Auctionator has recorded, printed to chat. The
+-- same data is shown as a table by /lf history and the History button.
 function LF:TrendLookup(query)
   query = string.match(query or "", "^%s*(.-)%s*$")
   if query == "" then
@@ -593,7 +664,7 @@ function LF:TrendLookup(query)
   local MAX_RESULTS = 4
   for index = 1, math.min(#matches, MAX_RESULTS) do
     local match = matches[index]
-    local link = GetItemInfo and select(2, GetItemInfo(match.itemId)) or nil
+    local link = self:GetItemLink(match.itemId)
     local label = link or match.name
 
     local stats = self:GetPriceTrend(match.itemId)

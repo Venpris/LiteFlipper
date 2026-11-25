@@ -62,50 +62,164 @@ local function SortRows(rows, key, ascending)
   end)
 end
 
-local function GetBrowseCount()
-  if GetNumAuctionItems then
-    return GetNumAuctionItems("list") or 0
+-- === Reading the auction house ===
+--
+-- The modern auction house has no "list of auctions on screen" to poll. It
+-- hands out three kinds of result set through events, and LiteFlipper turns
+-- each into the same row shape the rest of the addon works with:
+--
+--   browse results    one row per item: lowest price and total quantity
+--   commodity ladder  one row per price level of a stackable item
+--   item listings     one row per auction of a non-stackable item
+--
+-- The most recent result set is "what is on screen" for /lf scan and
+-- /lf browse. LiteFlipper never sends queries of its own.
+
+local liveAuctions = {}
+local liveSource
+
+local function GetItemKeyName(itemKey)
+  if not (C_AuctionHouse and C_AuctionHouse.GetItemKeyInfo) then
+    return nil
   end
-  return 0
+  local ok, info = pcall(C_AuctionHouse.GetItemKeyInfo, itemKey)
+  if ok and type(info) == "table" then
+    return info.itemName, info.iconFileID, info.quality
+  end
+  return nil
 end
 
-local function GetBrowseItem(index)
-  if not GetAuctionItemInfo then
+-- bulk: converting a whole-house scan. Asking the auction house for item key
+-- details thousands of times in one go would flood it, so names come from what
+-- is already known and are filled in later as rows are displayed.
+local function BrowseResultToAuction(result, bulk)
+  if type(result) ~= "table" or type(result.itemKey) ~= "table" then
     return nil
   end
 
-  local name, texture, count, quality, canUse, level, levelColHeader, minBid, minIncrement, buyoutPrice, bidAmount,
-    highBidder, bidderFullName, owner, ownerFullName, saleStatus, itemId, hasAllInfo = GetAuctionItemInfo("list", index)
-
-  if not name or not buyoutPrice or buyoutPrice <= 0 then
+  local itemKey = result.itemKey
+  local itemId = itemKey.itemID
+  local minPrice = result.minPrice
+  local quantity = result.totalQuantity
+  if not itemId or itemId == 0 or (itemKey.battlePetSpeciesID or 0) ~= 0 then
+    return nil
+  end
+  if type(minPrice) ~= "number" or minPrice <= 0 or type(quantity) ~= "number" or quantity <= 0 then
     return nil
   end
 
-  local itemLink = GetAuctionItemLink and GetAuctionItemLink("list", index) or nil
-  if not itemLink then
-    return nil
+  local name, texture, quality
+  if not bulk then
+    name, texture, quality = GetItemKeyName(itemKey)
   end
-
-  local stackSize = count and count > 0 and count or 1
+  if not name or name == "" then
+    name = LF:GetItemName(itemId, true)
+  end
 
   return {
-    index = index,
     name = name,
     texture = texture,
-    itemLink = itemLink,
     itemId = itemId,
-    stackSize = stackSize,
-    buyout = buyoutPrice,
-    unitBuyout = math.floor(buyoutPrice / stackSize),
-    owner = ownerFullName or owner,
+    stackSize = quantity,
+    buyout = minPrice * quantity,
+    unitBuyout = minPrice,
     quality = quality or 1,
+    -- The price is the item's lowest listing, not a specific auction.
+    summary = true,
   }
+end
+
+function LF:BrowseResultsToAuctions(results)
+  local auctions = {}
+  local bulk = type(results) == "table" and #results > 200
+  for _, result in ipairs(results or {}) do
+    local auction = BrowseResultToAuction(result, bulk)
+    if auction then
+      table.insert(auctions, auction)
+    end
+  end
+  return auctions
+end
+
+local function JoinOwners(owners)
+  if type(owners) ~= "table" or #owners == 0 then
+    return nil
+  end
+  local names = {}
+  for index, owner in ipairs(owners) do
+    names[index] = (owner == "player") and (UnitName and UnitName("player") or "You") or tostring(owner)
+  end
+  return table.concat(names, ", ")
+end
+
+local function CommodityLadderToAuctions(itemId)
+  local auctions = {}
+  if not (C_AuctionHouse and C_AuctionHouse.GetNumCommoditySearchResults) then
+    return auctions
+  end
+
+  local name = LF:GetItemName(itemId)
+  for index = 1, C_AuctionHouse.GetNumCommoditySearchResults(itemId) or 0 do
+    local info = C_AuctionHouse.GetCommoditySearchResultInfo(itemId, index)
+    if info and type(info.unitPrice) == "number" and info.unitPrice > 0
+      and type(info.quantity) == "number" and info.quantity > 0 then
+      table.insert(auctions, {
+        index = index,
+        name = name,
+        itemId = itemId,
+        stackSize = info.quantity,
+        buyout = info.unitPrice * info.quantity,
+        unitBuyout = info.unitPrice,
+        owner = JoinOwners(info.owners),
+        quality = 1,
+      })
+    end
+  end
+  return auctions
+end
+
+local function ItemListingsToAuctions(itemKey)
+  local auctions = {}
+  if type(itemKey) ~= "table" or not (C_AuctionHouse and C_AuctionHouse.GetNumItemSearchResults) then
+    return auctions
+  end
+
+  local itemId = itemKey.itemID
+  local name, texture, quality = GetItemKeyName(itemKey)
+  if not name or name == "" then
+    name = LF:GetItemName(itemId)
+  end
+
+  for index = 1, C_AuctionHouse.GetNumItemSearchResults(itemKey) or 0 do
+    local info = C_AuctionHouse.GetItemSearchResultInfo(itemKey, index)
+    local buyout = info and info.buyoutAmount
+    if type(buyout) == "number" and buyout > 0 then
+      local quantity = (type(info.quantity) == "number" and info.quantity > 0) and info.quantity or 1
+      table.insert(auctions, {
+        index = index,
+        name = name,
+        texture = texture,
+        itemLink = info.itemLink,
+        itemId = itemId,
+        stackSize = quantity,
+        buyout = buyout,
+        unitBuyout = math.floor(buyout / quantity),
+        owner = JoinOwners(info.owners),
+        quality = quality or 1,
+      })
+    end
+  end
+  return auctions
+end
+
+local function GetBrowseCount()
+  return #liveAuctions
 end
 
 local function IsUsableAuction(auction)
   return type(auction) == "table"
-    and type(auction.itemLink) == "string"
-    and string.find(auction.itemLink, "item:", 1, true) ~= nil
+    and (type(auction.itemId) == "number"
+      or (type(auction.itemLink) == "string" and string.find(auction.itemLink, "item:", 1, true) ~= nil))
     and type(auction.unitBuyout) == "number"
     and auction.unitBuyout > 0
     and type(auction.stackSize) == "number"
@@ -123,17 +237,26 @@ local function FormatSignedMoney(value)
   return LF:FormatMoney(value)
 end
 
-local function RowOnClick(self)
+local function RowOnClick(self, button)
   local deal = self.deal
   if not deal then
     return
   end
 
-  if ChatEdit_GetActiveWindow() then
-    ChatEdit_InsertLink(deal.itemLink or deal.name)
-  elseif deal.itemLink then
-    HandleModifiedItemClick(deal.itemLink)
+  local itemId = tonumber(deal.itemId or LF:GetItemKey(deal.itemLink))
+
+  if button == "RightButton" then
+    if LF.ShowPriceHistory and itemId then
+      LF:ShowPriceHistory(itemId, { name = deal.name })
+    end
+    return
   end
+
+  local link = deal.itemLink
+  if not (type(link) == "string" and string.find(link, "|H", 1, true)) then
+    link = itemId and LF:GetItemLink(itemId) or nil
+  end
+  LF:HandleItemClick(link)
 end
 
 local function RowOnEnter(self)
@@ -144,11 +267,17 @@ local function RowOnEnter(self)
 
   GameTooltip:SetOwner(self, "ANCHOR_LEFT")
 
-  if deal.itemLink then
-    GameTooltip:SetHyperlink(deal.itemLink)
+  local hyperlink = LF:GetRowHyperlink(deal)
+  if hyperlink then
+    GameTooltip:SetHyperlink(hyperlink)
   else
     GameTooltip:SetText(deal.name or "Unknown item")
   end
+  GameTooltip:AddLine(" ")
+  if deal.summary then
+    GameTooltip:AddLine("Lowest listing; Qty is the total on the auction house.", 0.65, 0.65, 0.65)
+  end
+  GameTooltip:AddLine("Right-click for price history.", 0.65, 0.65, 0.65)
   if deal.auctionCount and deal.auctionCount > 1 then
     GameTooltip:AddLine(" ")
     GameTooltip:AddDoubleLine("LiteFlipper lots", tostring(deal.auctionCount), 0.31, 0.70, 1, 1, 1, 1)
@@ -594,7 +723,7 @@ function LF:RenderResultsPage()
         pctR, pctG, pctB = GetPercentColor(pct)
       end
       SetFontStringText(row.cells.rank, dealIndex .. ".")
-      SetFontStringText(row.cells.item, deal.itemLink or deal.name)
+      SetFontStringText(row.cells.item, LF:GetRowDisplayText(deal))
       SetFontStringText(row.cells.qty, tostring(deal.stackSize or 1))
       SetFontStringText(row.cells.lots, tostring(deal.auctionCount or 1))
       SetFontStringText(row.cells.unit, self:FormatMoney(deal.unitBuyout))
@@ -603,7 +732,7 @@ function LF:RenderResultsPage()
       SetFontStringText(row.cells.profit, FormatSignedMoney(deal.profit))
       SetFontStringText(row.cells.seen, tostring(deal.visibleSupplyUnits or deal.stackSize or 1))
       SetFontStringText(row.cells.trend, deal.supplyTrend or "-")
-      row.icon:SetTexture(deal.texture or (deal.itemId and GetItemIcon and GetItemIcon(deal.itemId)) or "Interface\\Icons\\INV_Misc_QuestionMark")
+      row.icon:SetTexture(deal.texture or LF:GetItemIcon(deal.itemId or LF:GetItemKey(deal.itemLink)))
       row.cells.pct:SetTextColor(pctR, pctG, pctB)
       row.cells.profit:SetTextColor(pctR, pctG, pctB)
       row.cells.unit:SetTextColor(pctR, pctG, pctB)
@@ -721,6 +850,7 @@ function LF:CreateResultsFrame()
     row:SetHeight(ROW_HEIGHT)
     row:SetPoint("TOPLEFT", 16, -78 - ((index - 1) * ROW_HEIGHT))
     row:SetPoint("RIGHT", -16, 0)
+    row:RegisterForClicks("LeftButtonUp", "RightButtonUp")
     row:SetScript("OnClick", RowOnClick)
     row:SetScript("OnEnter", RowOnEnter)
     row:SetScript("OnLeave", RowOnLeave)
@@ -1008,44 +1138,46 @@ function LF:BuildScanResultCache(scan, auctions)
   return dealRows, browseRows
 end
 
+-- The rows of the most recent result set the auction house delivered.
 function LF:CaptureCurrentAuctions()
-  local count = GetBrowseCount()
   local auctions = {}
 
-  for index = 1, count do
-    local auction = GetBrowseItem(index)
-    if auction then
+  for _, auction in ipairs(liveAuctions) do
+    if IsUsableAuction(auction) then
       table.insert(auctions, auction)
     end
   end
 
-  return auctions, count
+  return auctions, #liveAuctions
 end
 
-function LF:RefreshLastScanSnapshot()
-  if not self.db then
-    return false
+-- Learns from a result set without making it the saved snapshot: records
+-- the prices into history and remembers each item's lowest price as its
+-- current low.
+function LF:ObserveAuctions(auctions)
+  if not self.db or type(auctions) ~= "table" or #auctions == 0 then
+    return
   end
 
-  local count = GetBrowseCount()
-  if count == 0 then
-    return false
+  local lowest = {}
+  for _, auction in ipairs(auctions) do
+    if IsUsableAuction(auction) then
+      local itemKey = tostring(auction.itemId or self:GetItemKey(auction.itemLink))
+      local price = auction.unitBuyout
+      if not lowest[itemKey] or price < lowest[itemKey] then
+        lowest[itemKey] = price
+      end
+    end
   end
 
-  local auctions, scanned = self:CaptureCurrentAuctions()
-  if #auctions == 0 then
-    return false
+  local recentLows = self:GetRecentLows()
+  local now = time()
+  for itemKey, price in pairs(lowest) do
+    recentLows[itemKey] = { p = price, t = now }
   end
 
-  self.lastScan = {
-    auctions = auctions,
-    count = scanned,
-    scannedAt = time(),
-    sourceLabel = "AH browse",
-  }
-  self:SaveLastScan()
-  self:Debug("Saved latest AH snapshot with " .. #auctions .. " buyout auction(s).")
-  return true
+  self.craftCostMemo = nil
+  self:RecordAuctionObservationsAsync(auctions)
 end
 
 function LF:RecordAuctionObservations(auctions)
@@ -1073,6 +1205,22 @@ function LF:RecordAuctionObservations(auctions)
       self:RecordScanPriceSample(itemKey, scanAverage, supply.auctions, supply.units, listingPrices)
     end
   end
+end
+
+-- Large recordings run a few rows per frame. They are queued rather than
+-- started side by side, because starting a job on a channel cancels the one
+-- already running there and its remaining rows would be lost.
+local historyQueue = {}
+local historyJobActive = false
+
+local function RunNextHistoryJob()
+  local job = table.remove(historyQueue, 1)
+  if not job then
+    historyJobActive = false
+    return
+  end
+  historyJobActive = true
+  StartAuctionJob(job)
 end
 
 function LF:RecordAuctionObservationsAsync(auctions, onComplete)
@@ -1142,11 +1290,18 @@ function LF:RecordAuctionObservationsAsync(auctions, onComplete)
     if self.onComplete then
       self.onComplete()
     end
+    if self.queued then
+      RunNextHistoryJob()
+    end
   end
 
   if job.total >= ASYNC_THRESHOLD then
     self:Debug("Recording " .. job.total .. " auction observation(s) in the background.")
-    StartAuctionJob(job)
+    job.queued = true
+    table.insert(historyQueue, job)
+    if not historyJobActive then
+      RunNextHistoryJob()
+    end
   else
     while job:Step() do
     end
@@ -1195,7 +1350,10 @@ end
 function LF:BrowseAuctionHouse(searchText)
   searchText = string.match(searchText or "", "^%s*(.-)%s*$")
   local count = GetBrowseCount()
-  if count == 0 then
+  -- The modern auction house nearly always has some small result set on
+  -- screen (one search, or one item's listings). As with /lf scan, that should
+  -- not hide the saved whole-house scan.
+  if count == 0 or ShouldPreferSavedScan(count) then
     if self:BrowseLastScan(nil, searchText) then
       self:Print("Using " .. GetSavedScanSummary(self.lastScan) .. ".")
     else
@@ -1216,10 +1374,9 @@ function LF:BrowseAuctionHouse(searchText)
     return
   end
 
-  local historyAlreadyRecorded = self.lastScan
-    and self.lastScan.historyRecorded
+  local previousScan = self.lastScan
     and IsSameAuctionSnapshot(self.lastScan.auctions, auctions)
-  local previousScan = historyAlreadyRecorded and self.lastScan or nil
+    and self.lastScan or nil
   if previousScan then
     local cached = GetCachedScanRows(previousScan, "browse")
     if cached then
@@ -1229,10 +1386,7 @@ function LF:BrowseAuctionHouse(searchText)
     end
   end
 
-  if not historyAlreadyRecorded then
-    self:RecordAuctionObservations(auctions)
-  end
-
+  -- Prices were already recorded when the result set arrived.
   local scan = previousScan or {
     auctions = auctions,
     count = scanned,
@@ -1275,10 +1429,9 @@ function LF:ScanAuctionHouse()
     return
   end
 
-  local historyAlreadyRecorded = self.lastScan
-    and self.lastScan.historyRecorded
+  local previousScan = self.lastScan
     and IsSameAuctionSnapshot(self.lastScan.auctions, auctions)
-  local previousScan = historyAlreadyRecorded and self.lastScan or nil
+    and self.lastScan or nil
   if previousScan then
     local cached = GetCachedScanRows(previousScan, "deals")
     if cached then
@@ -1288,10 +1441,7 @@ function LF:ScanAuctionHouse()
     end
   end
 
-  if not historyAlreadyRecorded then
-    self:RecordAuctionObservations(auctions)
-  end
-
+  -- Prices were already recorded when the result set arrived.
   local scan = previousScan or {
     auctions = auctions,
     count = scanned,
@@ -1305,4 +1455,129 @@ function LF:ScanAuctionHouse()
   local deals = self:BuildScanResultCache(scan, auctions)
   self:ShowDeals(deals, scanned, "Scanned")
   self:Print("Found " .. #deals .. " deal(s) in " .. scanned .. " visible auction(s).")
+end
+
+-- === Auction house events ===
+
+local function SetLiveAuctions(auctions, source)
+  liveAuctions = auctions
+  liveSource = source
+end
+
+local refreshQueued = false
+
+-- Item names and links arrive from the server a moment after they are first
+-- asked for; redraw whatever LiteFlipper window is open once they do.
+local function QueueVisibleRefresh()
+  if refreshQueued or not (C_Timer and C_Timer.After) then
+    return
+  end
+
+  local anyShown = (LF.resultsFrame and LF.resultsFrame:IsShown())
+    or (LF.craftFrame and LF.craftFrame:IsShown())
+    or (LF.bagFrame and LF.bagFrame:IsShown())
+    or (LF.historyFrame and LF.historyFrame:IsShown())
+  if not anyShown then
+    return
+  end
+
+  refreshQueued = true
+  C_Timer.After(0.3, function()
+    refreshQueued = false
+    if LF.resultsFrame and LF.resultsFrame:IsShown() then
+      LF:RenderResultsPage()
+    end
+    if LF.craftFrame and LF.craftFrame:IsShown() and LF.RenderCraftPage then
+      LF:RenderCraftPage()
+    end
+    if LF.bagFrame and LF.bagFrame:IsShown() and LF.RenderBagPage then
+      LF:RenderBagPage()
+    end
+    if LF.historyFrame and LF.historyFrame:IsShown() and LF.RefreshHistoryFrame then
+      LF:RefreshHistoryFrame()
+    end
+  end)
+end
+
+local auctionEvents = CreateFrame("Frame")
+
+local function OnAuctionEvent(_, event, ...)
+  if event == "GET_ITEM_INFO_RECEIVED" then
+    QueueVisibleRefresh()
+    return
+  end
+
+  if not LF.db then
+    return
+  end
+
+  if event == "AUCTION_HOUSE_CLOSED" then
+    SetLiveAuctions({}, nil)
+    LF.auctionatorScanActive = false
+    return
+  end
+
+  if not C_AuctionHouse then
+    return
+  end
+
+  if event == "AUCTION_HOUSE_BROWSE_RESULTS_UPDATED" then
+    if LF.auctionatorScanActive or not C_AuctionHouse.GetBrowseResults then
+      return
+    end
+    local auctions = LF:BrowseResultsToAuctions(C_AuctionHouse.GetBrowseResults())
+    SetLiveAuctions(auctions, "browse")
+    LF:ObserveAuctions(auctions)
+  elseif event == "AUCTION_HOUSE_BROWSE_RESULTS_ADDED" then
+    if LF.auctionatorScanActive then
+      return
+    end
+    local added = LF:BrowseResultsToAuctions((...))
+    if liveSource == "browse" then
+      for _, auction in ipairs(added) do
+        table.insert(liveAuctions, auction)
+      end
+    else
+      SetLiveAuctions(added, "browse")
+    end
+    LF:ObserveAuctions(added)
+  elseif event == "COMMODITY_SEARCH_RESULTS_UPDATED" then
+    local itemId = ...
+    if type(itemId) == "number" then
+      local auctions = CommodityLadderToAuctions(itemId)
+      if #auctions > 0 then
+        SetLiveAuctions(auctions, "commodity")
+        LF:ObserveAuctions(auctions)
+      end
+    end
+  elseif event == "ITEM_SEARCH_RESULTS_UPDATED" then
+    local auctions = ItemListingsToAuctions((...))
+    if #auctions > 0 then
+      SetLiveAuctions(auctions, "item")
+      LF:ObserveAuctions(auctions)
+    end
+  end
+end
+
+auctionEvents:SetScript("OnEvent", function(frame, event, ...)
+  -- Never let a problem while reading results interfere with the auction
+  -- house itself; report it once instead.
+  local ok, errorMessage = pcall(OnAuctionEvent, frame, event, ...)
+  if not ok and not LF.auctionEventErrorReported then
+    LF.auctionEventErrorReported = true
+    LF:Print("Reading auction results hit an error (shown once per session): " .. tostring(errorMessage))
+  end
+end)
+
+for _, event in ipairs({
+  "AUCTION_HOUSE_BROWSE_RESULTS_UPDATED",
+  "AUCTION_HOUSE_BROWSE_RESULTS_ADDED",
+  "COMMODITY_SEARCH_RESULTS_UPDATED",
+  "ITEM_SEARCH_RESULTS_UPDATED",
+  "AUCTION_HOUSE_CLOSED",
+  "GET_ITEM_INFO_RECEIVED",
+}) do
+  -- Registering an event the client does not have raises an error, and which
+  -- of these exist differs between client flavours.
+  pcall(auctionEvents.RegisterEvent, auctionEvents, event)
 end

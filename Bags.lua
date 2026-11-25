@@ -52,7 +52,7 @@ function LF:BagScan()
   local order = {}
   local boundSkipped = 0
 
-  for bag = 0, 4 do
+  for bag = 0, (NUM_BAG_SLOTS or 4) do
     for slot = 1, GetBagSlotCount(bag) do
       local itemId, count, link, isBound = GetBagItem(bag, slot)
       if itemId then
@@ -81,13 +81,11 @@ function LF:BagScan()
 
   local rows = {}
   for _, entry in ipairs(order) do
-    local name, resolvedLink, _, _, _, _, _, _, _, _, vendorSell
-    if GetItemInfo then
-      name, resolvedLink, _, _, _, _, _, _, _, _, vendorSell = GetItemInfo(entry.link or entry.itemId)
-    end
+    local name, resolvedLink, _, _, _, _, _, _, _, _, vendorSell = self:GetItemInfo(entry.link or entry.itemId)
     local link = entry.link or resolvedLink
     name = name
       or (link and string.match(link, "%[(.-)%]"))
+      or self:GetItemName(entry.itemId)
       or ("item " .. entry.itemId)
 
     local marketValue = self:GetMarketValue(link or entry.itemId)
@@ -115,17 +113,20 @@ end
 
 -- === Results UI ===
 
-local function BagRowOnClick(self)
+local function BagRowOnClick(self, button)
   local row = self.bagRow
-  if not row or not row.link then
+  if not row then
     return
   end
 
-  if ChatEdit_GetActiveWindow() then
-    ChatEdit_InsertLink(row.link)
-  else
-    HandleModifiedItemClick(row.link)
+  if button == "RightButton" then
+    if LF.ShowPriceHistory then
+      LF:ShowPriceHistory(row.itemId, { name = row.name, link = row.link })
+    end
+    return
   end
+
+  LF:HandleItemClick(row.link)
 end
 
 local function BagRowOnEnter(self)
@@ -140,6 +141,8 @@ local function BagRowOnEnter(self)
   else
     GameTooltip:SetText(row.name)
   end
+  GameTooltip:AddLine(" ")
+  GameTooltip:AddLine("Right-click for price history.", 0.65, 0.65, 0.65)
   GameTooltip:Show()
 end
 
@@ -178,7 +181,7 @@ function LF:RenderBagPage()
       else
         row.cells.item:SetTextColor(0.55, 0.55, 0.55)
       end
-      row.icon:SetTexture((GetItemIcon and GetItemIcon(data.itemId)) or "Interface\\Icons\\INV_Misc_QuestionMark")
+      row.icon:SetTexture(self:GetItemIcon(data.itemId))
       row:Show()
     else
       for _, cell in pairs(row.cells) do
@@ -245,6 +248,7 @@ function LF:CreateBagFrame()
     row:SetHeight(ROW_HEIGHT)
     row:SetPoint("TOPLEFT", 16, -78 - ((index - 1) * ROW_HEIGHT))
     row:SetPoint("RIGHT", -16, 0)
+    row:RegisterForClicks("LeftButtonUp", "RightButtonUp")
     row:SetScript("OnClick", BagRowOnClick)
     row:SetScript("OnEnter", BagRowOnEnter)
     row:SetScript("OnLeave", BagRowOnLeave)
