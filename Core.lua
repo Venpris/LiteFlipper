@@ -4,7 +4,7 @@ local LF = {}
 ns.LF = LF
 
 LF.name = ADDON_NAME
-LF.version = "0.2.0"
+LF.version = "0.2.1"
 
 local DEFAULTS = {
   daysToAverage = 7,

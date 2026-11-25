@@ -314,19 +314,31 @@ do
     return table.concat({ LF:FormatMoneyParts(copper) }, "/")
   end
   check(parts(335352) == "33" .. GOLD .. "/53" .. SILVER .. "/52" .. COPPER, "money parts: gold, silver and copper")
-  check(parts(350099) == "35" .. GOLD .. "//99" .. COPPER, "money parts: zero silver is left empty")
-  check(parts(395000) == "39" .. GOLD .. "/50" .. SILVER .. "/", "money parts: zero copper is left empty")
-  check(parts(350000) == "35" .. GOLD .. "//", "money parts: gold only")
+  check(parts(350099) == "35" .. GOLD .. "/0" .. SILVER .. "/99" .. COPPER, "money parts: zero silver shows as 0")
+  check(parts(395000) == "39" .. GOLD .. "/50" .. SILVER .. "/0" .. COPPER, "money parts: zero copper shows as 0")
+  check(parts(350000) == "35" .. GOLD .. "/0" .. SILVER .. "/0" .. COPPER, "money parts: round gold shows 0 silver and 0 copper")
+  check(parts(500) == "/5" .. SILVER .. "/0" .. COPPER, "money parts: no gold shown below 1g, copper still shown")
   check(parts(75) == "//75" .. COPPER, "money parts: copper only")
   check(parts(0) == "//0" .. COPPER, "money parts: zero shows as 0 copper")
   check(parts(nil) == "//-", "money parts: unknown price")
   check(parts(12345678):find("^1,?234|T") ~= nil, "money parts: large gold amount")
+  check(LF:FormatMoneyIcons(350000) == "35" .. GOLD .. " 0" .. SILVER .. " 0" .. COPPER, "one-line price shows zero coin types too")
+  check(LF:FormatMoneyIcons(75) == "75" .. COPPER and LF:FormatMoneyIcons(nil) == "-", "one-line price: copper only, and unknown")
 
   local first = LF.historyFrame.rows[1]
   check(first.money.low.gold:GetText() == "33" .. GOLD and first.money.low.silver:GetText() == "99" .. SILVER
-    and first.money.low.copper:GetText() == "", "low price rendered per coin type")
-  check(first.money.high.gold:GetText() == "34" .. GOLD and first.money.high.silver:GetText() == "20" .. SILVER,
-    "high price rendered per coin type")
+    and first.money.low.copper:GetText() == "0" .. COPPER, "low price rendered per coin type")
+  check(first.money.high.gold:GetText() == "34" .. GOLD and first.money.high.silver:GetText() == "20" .. SILVER
+    and first.money.high.copper:GetText() == "0" .. COPPER, "high price rendered per coin type")
+  local lowestSeen
+  for _, historyRow in ipairs(rows) do
+    if historyRow.low and (not lowestSeen or historyRow.low < lowestSeen) then
+      lowestSeen = historyRow.low
+    end
+  end
+  check(lowestSeen == 310000 and LF.historyFrame.summary3:GetText():find(
+    "Lowest: |cffffffff31" .. GOLD .. " 0" .. SILVER .. " 0" .. COPPER, 1, true) ~= nil,
+    "summary line uses the same price format: " .. tostring(LF.historyFrame.summary3:GetText()))
 
   -- Same coin type, same anchor, on every row and at a different place per type.
   local function anchorX(piece)

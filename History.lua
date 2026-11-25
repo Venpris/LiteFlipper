@@ -78,26 +78,12 @@ local function CoinSuffix(kind)
   return COIN_TEXTURES[kind]
 end
 
--- Coin-icon money text, matching how the auction house itself shows prices.
-function LF:FormatMoneyIcons(copper)
-  copper = tonumber(copper)
-  if not copper or copper < 0 then
-    return "-"
-  end
-  copper = math.floor(copper + 0.5)
-  if GetMoneyString then
-    local ok, text = pcall(GetMoneyString, copper, true)
-    if ok and text then
-      return text
-    end
-  end
-  return self:FormatMoney(copper)
-end
-
--- The same price as three separate texts (gold, silver, copper) for tables that
--- give each coin type its own position. A coin type that is zero is left empty,
--- as the game's own money text leaves it out; a price of exactly zero shows as
--- 0 copper, and an unknown price as "-" in the copper position.
+-- A price as three separate texts (gold, silver, copper) for tables that give
+-- each coin type its own position. Prices read the way the auction house lists
+-- them: once a larger coin type is present the smaller ones are always shown,
+-- as 0 when there are none (34g 0s 0c, not 34g), while coin types above the
+-- price are left empty (5s 0c, 75c). An unknown price is "-" in the copper
+-- position.
 function LF:FormatMoneyParts(copper)
   copper = tonumber(copper)
   if not copper or copper < 0 then
@@ -122,9 +108,20 @@ function LF:FormatMoneyParts(copper)
     goldText = amount .. CoinSuffix("gold")
   end
 
-  local silverText = silver > 0 and (silver .. CoinSuffix("silver")) or ""
-  local copperText = (coins > 0 or copper == 0) and (coins .. CoinSuffix("copper")) or ""
+  local silverText = (silver > 0 or gold > 0) and (silver .. CoinSuffix("silver")) or ""
+  local copperText = coins .. CoinSuffix("copper")
   return goldText, silverText, copperText
+end
+
+-- The same price as one coin-icon text, for summary lines and tooltips.
+function LF:FormatMoneyIcons(copper)
+  local pieces = {}
+  for _, text in ipairs({ self:FormatMoneyParts(copper) }) do
+    if text ~= "" then
+      pieces[#pieces + 1] = text
+    end
+  end
+  return table.concat(pieces, " ")
 end
 
 local function SetMoneyCells(pieces, copper)

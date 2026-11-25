@@ -2,7 +2,7 @@
 ## Title: LiteFlipper
 ## Notes: Lightweight Auctionator-powered market values, price history and flipping hints for WoW Forever.
 ## Author: Codex
-## Version: 0.2.0
+## Version: 0.2.1
 ## OptionalDeps: Auctionator
 ## SavedVariables: LiteFlipperDB
 ## IconTexture: Interface\Icons\INV_Misc_Coin_02
