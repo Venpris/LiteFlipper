@@ -11,22 +11,71 @@ local LF = ns.LF
 -- merged with the prices LiteFlipper records itself.
 
 local DAY_SECONDS = 86400
-local FRAME_WIDTH = 470
+local FRAME_WIDTH = 510
 local FRAME_HEIGHT = 452
 local ROW_HEIGHT = 20
 local VISIBLE_ROWS = 13
 local LIST_TOP = -138
+local ROW_LEFT = 16
 
+-- A price is drawn as three pieces (gold, silver, copper), each ending at its
+-- own fixed position, so the same coin type lines up down the whole table.
+-- COIN_STEP is the distance between those positions: room for "99" plus a coin.
+local COIN_STEP = 30
+local COIN_ORDER = { "copper", "silver", "gold" } -- right to left
+local MONEY_WIDTH = 44 + COIN_STEP * 2
+
+-- `gap` is the empty space to the left of a column.
 local COLUMNS = {
-  { key = "date", label = "Date", width = 112, justify = "LEFT" },
-  { key = "low", label = "Low", width = 96, justify = "RIGHT" },
-  { key = "high", label = "High", width = 96, justify = "RIGHT" },
-  { key = "available", label = "Available", width = 64, justify = "RIGHT" },
-  { key = "change", label = "Change", width = 52, justify = "RIGHT" },
+  { key = "date", label = "Date", width = 112, justify = "LEFT", gap = 2 },
+  { key = "low", label = "Low", width = MONEY_WIDTH, justify = "RIGHT", gap = 4, money = true },
+  { key = "high", label = "High", width = MONEY_WIDTH, justify = "RIGHT", gap = 10, money = true },
+  { key = "available", label = "Available", width = 60, justify = "RIGHT", gap = 6 },
+  { key = "change", label = "Change", width = 48, justify = "RIGHT", gap = 6 },
+}
+
+do
+  -- Left edge of each column, measured from the left edge of a row.
+  local x = 0
+  for _, column in ipairs(COLUMNS) do
+    x = x + column.gap
+    column.x = x
+    x = x + column.width
+  end
+end
+
+local COIN_TEXTURES = {
+  gold = "|TInterface\\MoneyFrame\\UI-GoldIcon:0:0:2:0|t",
+  silver = "|TInterface\\MoneyFrame\\UI-SilverIcon:0:0:2:0|t",
+  copper = "|TInterface\\MoneyFrame\\UI-CopperIcon:0:0:2:0|t",
 }
 
 local function IsCopper(value)
   return type(value) == "number" and value > 0 and value < 1000000000
+end
+
+-- The game swaps coin icons for letters in colourblind mode; do the same.
+local function UsesCoinLetters()
+  if ENABLE_COLORBLIND_MODE == "1" then
+    return true
+  end
+  if C_CVar and C_CVar.GetCVarBool then
+    local ok, enabled = pcall(C_CVar.GetCVarBool, "colorblindMode")
+    return ok and enabled == true
+  end
+  return false
+end
+
+local function CoinSuffix(kind)
+  if UsesCoinLetters() then
+    if kind == "gold" then
+      return GOLD_AMOUNT_SYMBOL or "g"
+    elseif kind == "silver" then
+      return SILVER_AMOUNT_SYMBOL or "s"
+    end
+    return COPPER_AMOUNT_SYMBOL or "c"
+  end
+  return COIN_TEXTURES[kind]
 end
 
 -- Coin-icon money text, matching how the auction house itself shows prices.
@@ -43,6 +92,46 @@ function LF:FormatMoneyIcons(copper)
     end
   end
   return self:FormatMoney(copper)
+end
+
+-- The same price as three separate texts (gold, silver, copper) for tables that
+-- give each coin type its own position. A coin type that is zero is left empty,
+-- as the game's own money text leaves it out; a price of exactly zero shows as
+-- 0 copper, and an unknown price as "-" in the copper position.
+function LF:FormatMoneyParts(copper)
+  copper = tonumber(copper)
+  if not copper or copper < 0 then
+    return "", "", "-"
+  end
+  copper = math.floor(copper + 0.5)
+
+  local gold = math.floor(copper / 10000)
+  local silver = math.floor(copper / 100) % 100
+  local coins = copper % 100
+
+  local goldText = ""
+  if gold > 0 then
+    local amount = tostring(gold)
+    local separateThousands = FormatLargeNumber or BreakUpLargeNumbers
+    if separateThousands then
+      local ok, text = pcall(separateThousands, gold)
+      if ok and text then
+        amount = text
+      end
+    end
+    goldText = amount .. CoinSuffix("gold")
+  end
+
+  local silverText = silver > 0 and (silver .. CoinSuffix("silver")) or ""
+  local copperText = (coins > 0 or copper == 0) and (coins .. CoinSuffix("copper")) or ""
+  return goldText, silverText, copperText
+end
+
+local function SetMoneyCells(pieces, copper)
+  local goldText, silverText, copperText = LF:FormatMoneyParts(copper)
+  pieces.gold:SetText(goldText)
+  pieces.silver:SetText(silverText)
+  pieces.copper:SetText(copperText)
 end
 
 -- === Data ===
@@ -225,8 +314,8 @@ function LF:RenderHistoryRows()
 
     if row then
       rowFrame.cells.date:SetText(FormatDate(row))
-      rowFrame.cells.low:SetText(self:FormatMoneyIcons(row.low))
-      rowFrame.cells.high:SetText(self:FormatMoneyIcons(row.high))
+      SetMoneyCells(rowFrame.money.low, row.low)
+      SetMoneyCells(rowFrame.money.high, row.high)
       rowFrame.cells.available:SetText(row.available and tostring(row.available) or "-")
       local changeText, r, g, b = FormatChange(row.change)
       rowFrame.cells.change:SetText(changeText)
@@ -443,15 +532,13 @@ function LF:CreateHistoryFrame()
   frame.summary2 = SummaryLine(-88)
   frame.summary3 = SummaryLine(-104)
 
-  local xOffset = 18
   for _, column in ipairs(COLUMNS) do
     local header = frame:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-    header:SetPoint("TOPLEFT", frame, "TOPLEFT", xOffset, LIST_TOP + 16)
+    header:SetPoint("TOPLEFT", frame, "TOPLEFT", ROW_LEFT + column.x, LIST_TOP + 16)
     header:SetWidth(column.width)
     header:SetJustifyH(column.justify)
     header:SetText(column.label)
     header:SetTextColor(1, 0.82, 0)
-    xOffset = xOffset + column.width + 4
   end
 
   frame.scrollFrame = CreateFrame("ScrollFrame", nil, frame, "FauxScrollFrameTemplate")
@@ -471,7 +558,7 @@ function LF:CreateHistoryFrame()
   for index = 1, VISIBLE_ROWS do
     local row = CreateFrame("Button", nil, frame)
     row:SetHeight(ROW_HEIGHT)
-    row:SetPoint("TOPLEFT", 16, LIST_TOP - ((index - 1) * ROW_HEIGHT))
+    row:SetPoint("TOPLEFT", ROW_LEFT, LIST_TOP - ((index - 1) * ROW_HEIGHT))
     row:SetPoint("RIGHT", -34, 0)
     row:SetScript("OnEnter", HistoryRowOnEnter)
     row:SetScript("OnLeave", HideTooltip)
@@ -486,19 +573,36 @@ function LF:CreateHistoryFrame()
     row.stripe:SetColorTexture(1, 1, 1, 0.04)
 
     row.cells = {}
-    local cellOffset = 2
+    row.money = {}
     for _, column in ipairs(COLUMNS) do
-      local cell = row:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
-      cell:SetPoint("LEFT", row, "LEFT", cellOffset, 0)
-      cell:SetWidth(column.width)
-      cell:SetHeight(ROW_HEIGHT)
-      cell:SetJustifyH(column.justify)
-      cell:SetJustifyV("MIDDLE")
-      if cell.SetWordWrap then
-        cell:SetWordWrap(false)
+      if column.money then
+        -- One text per coin type, each pinned by its right edge and left
+        -- without a fixed width: every row's gold ends at the same place, as
+        -- does its silver and copper, and a large gold amount grows to the
+        -- left instead of being cut off.
+        local pieces = {}
+        for position, kind in ipairs(COIN_ORDER) do
+          local piece = row:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+          piece:SetPoint("RIGHT", row, "LEFT", column.x + column.width - ((position - 1) * COIN_STEP), 0)
+          piece:SetJustifyH("RIGHT")
+          if piece.SetWordWrap then
+            piece:SetWordWrap(false)
+          end
+          pieces[kind] = piece
+        end
+        row.money[column.key] = pieces
+      else
+        local cell = row:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+        cell:SetPoint("LEFT", row, "LEFT", column.x, 0)
+        cell:SetWidth(column.width)
+        cell:SetHeight(ROW_HEIGHT)
+        cell:SetJustifyH(column.justify)
+        cell:SetJustifyV("MIDDLE")
+        if cell.SetWordWrap then
+          cell:SetWordWrap(false)
+        end
+        row.cells[column.key] = cell
       end
-      row.cells[column.key] = cell
-      cellOffset = cellOffset + column.width + 4
     end
 
     frame.rows[index] = row

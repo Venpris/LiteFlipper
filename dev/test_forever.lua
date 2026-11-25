@@ -304,7 +304,49 @@ check(#ownOnly == 1 and ownOnly[1].source == "LiteFlipper" and ownOnly[1].low ==
   "items Auctionator has no history for use LiteFlipper's own records")
 slash("history arcanite bar")
 check(LF.historyFrame:IsShown() and LF.historyFrame.itemId == 12360, "/lf history opens the window")
-check(LF.historyFrame.rows[1].cells.low:GetText() == "339900c", "row text rendered")
+do
+  -- Each price is split into gold / silver / copper texts so a coin type sits
+  -- at the same position on every row.
+  local GOLD = "|TInterface\\MoneyFrame\\UI-GoldIcon:0:0:2:0|t"
+  local SILVER = "|TInterface\\MoneyFrame\\UI-SilverIcon:0:0:2:0|t"
+  local COPPER = "|TInterface\\MoneyFrame\\UI-CopperIcon:0:0:2:0|t"
+  local function parts(copper)
+    return table.concat({ LF:FormatMoneyParts(copper) }, "/")
+  end
+  check(parts(335352) == "33" .. GOLD .. "/53" .. SILVER .. "/52" .. COPPER, "money parts: gold, silver and copper")
+  check(parts(350099) == "35" .. GOLD .. "//99" .. COPPER, "money parts: zero silver is left empty")
+  check(parts(395000) == "39" .. GOLD .. "/50" .. SILVER .. "/", "money parts: zero copper is left empty")
+  check(parts(350000) == "35" .. GOLD .. "//", "money parts: gold only")
+  check(parts(75) == "//75" .. COPPER, "money parts: copper only")
+  check(parts(0) == "//0" .. COPPER, "money parts: zero shows as 0 copper")
+  check(parts(nil) == "//-", "money parts: unknown price")
+  check(parts(12345678):find("^1,?234|T") ~= nil, "money parts: large gold amount")
+
+  local first = LF.historyFrame.rows[1]
+  check(first.money.low.gold:GetText() == "33" .. GOLD and first.money.low.silver:GetText() == "99" .. SILVER
+    and first.money.low.copper:GetText() == "", "low price rendered per coin type")
+  check(first.money.high.gold:GetText() == "34" .. GOLD and first.money.high.silver:GetText() == "20" .. SILVER,
+    "high price rendered per coin type")
+
+  -- Same coin type, same anchor, on every row and at a different place per type.
+  local function anchorX(piece)
+    local point = piece.__points[#piece.__points]
+    return point[1] == "RIGHT" and point[4]
+  end
+  local second = LF.historyFrame.rows[2]
+  local aligned = true
+  for _, key in ipairs({ "low", "high" }) do
+    for _, kind in ipairs({ "gold", "silver", "copper" }) do
+      if not anchorX(first.money[key][kind]) or anchorX(first.money[key][kind]) ~= anchorX(second.money[key][kind]) then
+        aligned = false
+      end
+    end
+  end
+  check(aligned, "coin types share a position across rows")
+  check(anchorX(first.money.low.gold) < anchorX(first.money.low.silver)
+    and anchorX(first.money.low.silver) < anchorX(first.money.low.copper)
+    and anchorX(first.money.low.copper) < anchorX(first.money.high.gold), "gold, silver, copper run left to right")
+end
 check(LF.historyFrame.rows[5]:IsShown() == false, "unused rows hidden")
 check(LF.historyFrame.summary3:GetText():find("4 day"), "summary counts the days")
 slash("history zzzz")
